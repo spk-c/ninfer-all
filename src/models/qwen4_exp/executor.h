@@ -59,6 +59,12 @@ struct ExecutorOptions {
     // How the sparse-attention layers store their paged KV: any storage kv_cache_append writes
     // for two heads of 256.
     KvCacheStorage kv_cache = KvCacheStorage::BFloat16;
+    // Positions of each sparse-attention layer's KV a sequence keeps in device memory; 0 keeps
+    // all of them. Fewer than max_context streams those layers (ops/kv_stream.h): their paged KV
+    // lives in pinned host memory, and the device keeps that many positions' blocks (at least
+    // what one decode or verification call reads), the ones the indexer selected most recently.
+    // A prompt chunk reads one layer's KV from a staging copy on the device.
+    std::uint32_t kv_resident = 0;
     // MTP drafts per speculative round (1..15), for a model loaded with its MTP block; 0 runs
     // without speculation.
     std::uint32_t draft_tokens = 0;
@@ -82,7 +88,11 @@ struct ExecutorMemory {
     std::uint64_t state_bytes        = 0;
     std::uint64_t workspace_bytes    = 0;
     std::uint64_t expert_cache_bytes = 0;
-    std::uint64_t kv_bytes = 0; // the sparse-attention layers' KV and scale pages, in state_bytes
+    // The sparse-attention layers' KV and scale pages on the device (a streamed layer's pool), in
+    // state_bytes, and a streamed layer's pinned host copies.
+    std::uint64_t kv_bytes      = 0;
+    std::uint64_t host_kv_bytes = 0;
+    bool streamed_kv            = false;
     std::vector<Rank> ranks; // by device rank
 };
 
@@ -168,14 +178,15 @@ public:
     void restore(std::uint32_t sequence, const SequenceSnapshot& from);
     // Bytes of an image at `position`.
     [[nodiscard]] std::uint64_t image_bytes(std::uint32_t position) const;
-    // Copies the sequence's state into `out` (image_bytes() of its position, pinned host memory):
-    // its live state, or the state at `at`, a snapshot it took whose positions it has not written
-    // since. Returns the image's header once the copies are done.
+    // Copies the sequence's state into `pages`, host memory that holds image_bytes() of its
+    // position in consecutive slices of `page_bytes` (the last one may be partly used): its live
+    // state, or the state at `at`, a snapshot it took whose positions it has not written since.
+    // Returns the image's header once the copies are done.
     SequenceImage save_image(std::uint32_t sequence, const SequenceSnapshot* at,
-                             std::span<std::byte> out);
+                             std::span<std::byte* const> pages, std::size_t page_bytes);
     // Makes the sequence hold the image's state; returns once the copies are done.
     void load_image(std::uint32_t sequence, const SequenceImage& image,
-                    std::span<const std::byte> bytes);
+                    std::span<std::byte* const> pages, std::size_t page_bytes);
     // Vision: encodes the media of the prompt the (just reset) sequence prefills next, whose image
     // and video tokens then take the items' merged embeddings in place of the token embedding.
     // `rope_positions` holds the prompt's three RoPE position axes, axis-major [3, tokens]; every

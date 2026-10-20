@@ -744,8 +744,27 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
                 automatic_kv, options.expert_cache_bytes, reserved[rank],
                 curve.extra_ranks[rank - 1].minimum_device_reservation_bytes) + headroom;
         }
+        // The routing profile given, else the one recorded on this family's release.
+        models::qwen3_5::execution::NativeExpertProfile profile;
+        const auto widths = models::qwen3_5::execution::NativeExpertRuntime::widths(*instance->model);
+        if (!options.hybrid_experts.routing_profile.empty()) {
+            profile.counts = models::read_expert_profile(options.hybrid_experts.routing_profile,
+                                                         instance->model->info().artifact_id, widths);
+        } else {
+            profile.counts = models::builtin_expert_profile("qwen3.5-moe", widths);
+        }
+        profile.record   = options.hybrid_experts.record_profile;
+        profile.artifact = instance->model->info().artifact_id;
         experts = std::make_unique<models::qwen3_5::execution::NativeExpertRuntime>(
-            *instance->model, device, reserved, options.expert_cache_bytes);
+            *instance->model, device, reserved, options.expert_cache_bytes, std::move(profile),
+            models::qwen3_5::execution::NativeExpertCpu{options.hybrid_experts.dma_share,
+                                                        options.hybrid_experts.cpu_threads});
+        if (const std::string cpu = experts->cpu_description(); !cpu.empty()) {
+            publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                               "native experts: missing experts split between copies and %s (%s)",
+                               cpu.c_str(), options.hybrid_experts.dma_share ? "fixed share"
+                                                                             : "by measured speeds");
+        }
         free_by_rank = free_bytes_by_rank(device, options.wddm_evictable_budget,
                                           instance->model->storage_stats().device_capacity_bytes);
         resolution = resolve_kv_capacity(

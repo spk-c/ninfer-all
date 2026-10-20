@@ -1,8 +1,9 @@
 #pragma once
 
-// SiLU x / (1 + e^-x) from correctly rounded operations only (multiply, add, divide, fused
-// multiply-add, round to integer and exact power-of-two scaling), so that the GPU's GGUF expert
-// kernels and the CPU's GGUF expert products (gguf_expert_cpu) compute the same bits; CUDA's expf
+// SiLU x / (1 + e^-x) (portable_silu, beside math.cuh's device silu) and the tanh-approximated
+// GELU from correctly rounded operations only (multiply, add, divide, fused multiply-add, round to
+// integer and exact power-of-two scaling), so that the GPU's expert kernels and the CPU's expert
+// products (gguf_expert_cpu, sparse_moe streamed_cpu) compute the same bits; CUDA's expf
 // goes through an approximate hardware exp2. e^y: n = rint(y log2 e), r = y - n ln2 with ln2 split
 // in two parts, e^r by Cephes' degree-6 polynomial (|r| <= ln2 / 2, within about one unit in the
 // last place), times 2^n. Every step is spelled out, so no compiler fuses a multiply and an add on
@@ -86,11 +87,26 @@ NINFER_SILU_HD float exp(float y) {
 
 namespace ninfer::ops {
 
-NINFER_SILU_HD float silu(float x) {
+NINFER_SILU_HD float portable_silu(float x) {
 #if defined(__CUDA_ARCH__)
     return __fdiv_rn(x, silu_detail::add(1.0F, silu_detail::exp(-x)));
 #else
     return x / silu_detail::add(1.0F, silu_detail::exp(-x));
+#endif
+}
+
+// The tanh-approximated GELU 0.5 x (1 + tanh(u)), u = sqrt(2 / pi) (x + 0.044715 x^3), in its
+// equal form x / (1 + e^(-2u)), from the same correctly rounded operations: the cube as
+// ((0.044715 x) x) x, then 2u = 2 sqrt(2 / pi) (x + cube).
+NINFER_SILU_HD float gelu_tanh(float x) {
+    using silu_detail::add;
+    using silu_detail::mul;
+    const float cube  = mul(mul(mul(0.044715F, x), x), x);
+    const float twice = mul(1.5957691216057308F, add(x, cube));
+#if defined(__CUDA_ARCH__)
+    return __fdiv_rn(x, add(1.0F, silu_detail::exp(-twice)));
+#else
+    return x / add(1.0F, silu_detail::exp(-twice));
 #endif
 }
 

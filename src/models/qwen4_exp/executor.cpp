@@ -3,6 +3,7 @@
 #include "core/arena.h"
 #include "core/decode_graph.h"
 #include "core/gdn_replay_records.h"
+#include "core/host_worker_pool.h"
 #include "core/layout.h"
 #include "core/linear_attention_state.h"
 #include "core/paged_kv_cache.h"
@@ -11,6 +12,7 @@
 #include "ninfer/ops/target_logprobs.h"
 #include "models/qwen4_exp/ngram_hash.h"
 #include "models/qwen4_exp/ngram_draft_prefetch.h"
+#include "models/expert_profile.h"
 #include "models/qwen4_exp/expert_misses.h"
 #include "models/qwen4_exp/expert_stream.h"
 #include "models/qwen4_exp/ngram_table.h"
@@ -25,6 +27,7 @@
 #include "ninfer/ops/gdn_gating.h"
 #include "ninfer/ops/hyper_connection.h"
 #include "ninfer/ops/kv_cache_append.h"
+#include "ninfer/ops/kv_stream.h"
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/moe_experts.h"
 #include "ninfer/ops/moe_route.h"
@@ -43,9 +46,12 @@
 #include <array>
 #include <cmath>
 #include <cstring>
+#include <future>
 #include <numeric>
+#include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -55,6 +61,8 @@ namespace {
 constexpr std::int32_t kAlign = 256;
 // Calls wider than this run their experts through the matrix kernel, from device memory.
 constexpr std::int32_t kVectorTokens = 8;
+// The family name of Flash-Next's built-in routing profiles (models/expert_profile.h).
+constexpr std::string_view kExpertProfileFamily = "qwen3.8-flash-next";
 // Zero bytes after every device slot's down matrix (see expert_stream.cpp and moe_experts_gguf).
 constexpr std::uint64_t kSlotTail = 256;
 
@@ -379,12 +387,26 @@ struct LayerPlan {
     MoePlan moe;
 };
 
+// One plane of a sparse-attention layer's paged KV, [leading, 64, heads, pages]: device memory,
+// or pinned host memory the device addresses directly when the layer streams.
+struct KvPlane {
+    DeviceBuffer device;
+    std::unique_ptr<PinnedHostBuffer> host;
+    void* p             = nullptr;
+    std::uint64_t bytes = 0;
+};
+
 // One sequence's mutable state of one layer, on that layer's device.
 struct LayerState {
-    Tensor ssm, conv;                            // Gated DeltaNet: the sequence's slot of the pool
-    DeviceBuffer k_pages, v_pages, pooled, tail; // sparse attention
-    DeviceBuffer k_scales, v_scales;             // a quantized KV's scale planes
-    DeviceBuffer history;                        // PLE
+    Tensor ssm, conv;          // Gated DeltaNet: the sequence's slot of the pool
+    std::array<KvPlane, 4> kv; // sparse attention: K, V and a quantized KV's K and V scales
+    DeviceBuffer pooled, tail; // the indexer's pooled keys and incomplete block
+    // A streamed layer (ExecutorOptions::kv_resident): `kv` lives in host memory and the device
+    // keeps a pool of 4-position pages of the same planes, with its residency map.
+    std::array<DeviceBuffer, 4> pool;
+    DeviceBuffer map_memory;
+    ops::KvStreamMap map;
+    DeviceBuffer history; // PLE
 };
 
 struct SequenceState {
@@ -431,7 +453,10 @@ struct SequenceState {
 // Consecutive layers on one rank, in pass order. The first segment also embeds the tokens, the
 // segment on the head rank after the last layer also runs the final mixer and the head. A rank's
 // first PLE layer starts a segment (`rows`) before which the pass uploads the n-gram rows, so the
-// layers before it run while the rows are read.
+// layers before it run while the rows are read. A segment holds at most kSegmentLayers layers: a
+// captured segment is one CUDA Graph, and the device starts a graph only once its launch has
+// submitted every node (about 1.8 us a kernel on a 4090: 2.9 ms for a 44-layer verification), so
+// shorter graphs let the first run while the host launches the rest.
 struct Segment {
     std::size_t rank  = 0;
     std::size_t begin = 0, end = 0; // layers
@@ -507,6 +532,12 @@ struct RankState {
     std::optional<ops::GdnReplayFoldPlan> fold;
     DeviceBuffer index_records, ple_records;
     DeviceBuffer conv_scratch, tail_scratch;
+    // Streamed sparse-attention layers: a prompt chunk reads one layer's whole KV from this
+    // device copy (the four planes, every page), which holds `kv_staged`'s positions before
+    // `kv_staged_end`; the layers of a span's attention phase keep it across the span's chunks.
+    std::array<DeviceBuffer, 4> kv_staging;
+    const LayerState* kv_staged = nullptr;
+    std::uint32_t kv_staged_end = 0;
 };
 
 } // namespace
@@ -562,6 +593,7 @@ struct Executor::Impl {
     Projection head;
     HcPlan final_mixer;
     std::vector<LayerPlan> layers;
+    static constexpr std::size_t kSegmentLayers = 6;
     std::vector<Segment> segments;
     std::vector<RankState> ranks;
     std::vector<SequenceState> sequences;
@@ -589,6 +621,10 @@ struct Executor::Impl {
     std::uint32_t pages          = 0; // KV pages per sequence and attention layer
     PagedKVStorageLayout kv_layout;   // the planes of every sparse-attention layer's KV
     std::uint32_t pooled_slots   = 0; // indexer blocks per sequence and attention layer
+    // Streamed sparse-attention layers (options.kv_resident): each sequence's layer keeps
+    // stream_slots pages of 4 positions on the device, from which calls of at most stream_width
+    // tokens read; wider calls read the rank's staging copy. Zero: every layer resident.
+    std::uint32_t stream_slots = 0, stream_width = 0;
     std::uint32_t max_logit_rows = 0;
     ExecutorMemory memory;
     std::vector<std::uint64_t> row_ids;
@@ -609,7 +645,6 @@ struct Executor::Impl {
     std::vector<void*> route_records;       // by expert layer
     std::unique_ptr<PinnedHostBuffer> route_host;
     std::uint32_t pending_routes = 0;
-    std::uint64_t pending_chunks = 1; // chunks of the pass whose routes are pending
 
     // Host-resident experts, wide calls: a layer's routed experts that the cache does not hold are
     // copied into device slots and the matrix kernel reads them there; one pool and one set of
@@ -630,17 +665,25 @@ struct Executor::Impl {
     };
 
     std::vector<SlotPool> slot_pools; // by rank; empty unless the experts are host resident
+    // With the automatic expert cache the pool buffers are cache slots between prompts
+    // (ExpertCache::lend): a wide pass takes them back, the next decode pass returns them.
+    bool pools_lent = false;
     std::unique_ptr<PinnedHostBuffer> slot_entries;
     // Wide host calls of at least kPrefetchTokens touch nearly every expert of a layer: every
     // expert the cache lacks is copied into the pool on the transfer stream while the layers
     // before run, without waiting for the layer's routes. Two pinned entry tables alternate.
+    // A layer's copies are hundreds of operations, and an enqueue blocks while the stream's queue
+    // is full, so a thread of their own (pool_copier) issues them: the layers between keep being
+    // launched.
     static constexpr std::int32_t kPrefetchTokens = 256;
     struct PoolPrefetch {
         // Per pool buffer: the layer whose experts it holds or receives, its copies' completion
-        // and the completion of the last call that read it.
+        // and the completion of the last call that read it, and the copier's task that issues
+        // the copies.
         struct Buffer {
             std::size_t layer = ~std::size_t{0};
             cudaEvent_t ready = nullptr, free = nullptr;
+            std::future<void> issued;
         };
 
         std::array<Buffer, 2> buffers;
@@ -651,6 +694,7 @@ struct Executor::Impl {
         int next = 0;
     };
     std::vector<PoolPrefetch> prefetches; // by rank
+    std::unique_ptr<HostWorkerPool> pool_copier;
 
     // Layer-major prompt spans (forward_span): the chunks' stacks, staged positions and n-gram
     // rows while every chunk of a span passes a layer before any passes the next. span_tokens is 0
@@ -658,6 +702,9 @@ struct Executor::Impl {
     static constexpr std::uint32_t kSpanChunks = 8;
     std::uint32_t span_tokens = 0;
     DeviceBuffer span_stack, span_positions, span_rope, span_rows;
+    // A span's n-gram rows, read in one batch while its layers before the first PLE layer run.
+    std::unique_ptr<PinnedHostBuffer> span_host_rows;
+    std::vector<std::uint64_t> span_row_ids;
     // Each chunk's MoE input and hyper-connection injection between a layer's two phases.
     DeviceBuffer span_mixed, span_inject;
     std::size_t span_row_bytes = 0; // n-gram rows of one token
@@ -715,6 +762,17 @@ struct Executor::Impl {
         pooled_slots   = options.max_context / config.indexer_compress_ratio + 1;
         kv_layout =
             paged_kv_storage_layout(options.kv_cache, static_cast<std::int32_t>(config.head_dim));
+        if (options.kv_resident != 0) {
+            // A decode, verification or MTP call reads at most this many queries' blocks at once.
+            const std::uint32_t width = std::max<std::uint32_t>(verify_width, 1);
+            const std::uint32_t slots = std::max<std::uint32_t>(
+                (options.kv_resident + ops::kKvStreamPageTokens - 1) / ops::kKvStreamPageTokens,
+                std::uint32_t(ops::kv_stream_minimum_slots(std::int32_t(width))));
+            if (std::uint64_t(slots) * ops::kKvStreamPageTokens < options.max_context) {
+                stream_slots = slots;
+                stream_width = width;
+            }
+        }
         memory.ranks.resize(device.size());
         plan_weights();
         if (verify_width > 0) { plan_mtp(); }
@@ -733,16 +791,14 @@ struct Executor::Impl {
         }
         const auto residency = model.options().experts;
         if (residency == ExpertResidency::Device &&
-            (options.hybrid_experts.dma_share != HybridExpertOptions{}.dma_share ||
-             options.hybrid_experts.dma_share_auto || options.hybrid_experts.cpu_threads != 0 ||
+            (options.hybrid_experts.dma_share || options.hybrid_experts.cpu_threads != 0 ||
              options.hybrid_experts.mapped_misses)) {
             throw std::invalid_argument("expert DMA shares, CPU threads and miss paths require "
                                         "host or disk experts");
         }
         if (options.hybrid_experts.mapped_misses &&
             (residency != ExpertResidency::Host || native_host ||
-             options.hybrid_experts.dma_share != HybridExpertOptions{}.dma_share ||
-             options.hybrid_experts.dma_share_auto)) {
+             options.hybrid_experts.dma_share.value_or(1.0F) != 1.0F)) {
             throw std::invalid_argument("mapped misses need GGUF host experts and all misses on the GPU");
         }
         if (options.hybrid_experts.tail_skip_rank != 0 &&
@@ -751,7 +807,7 @@ struct Executor::Impl {
             throw std::invalid_argument(
                 "--expert-tail-skip needs GGUF host experts with staged misses");
         }
-        if (options.hybrid_experts.prefill_buffers != 1 &&
+        if (options.hybrid_experts.prefill_buffers != 0 &&
             (residency != ExpertResidency::Host || native_host)) {
             throw std::invalid_argument("--expert-prefill-buffers needs GGUF host experts");
         }
@@ -759,9 +815,11 @@ struct Executor::Impl {
         allocate_ranks();
         allocate_vision();
         allocate_sequences();
+        allocate_staging();
         if (verify_width > 0) { allocate_speculation(); }
         allocate_span();
         allocate_cache();
+        memory.streamed_kv = stream_slots != 0;
         for (const auto& rank : memory.ranks) {
             memory.state_bytes += rank.state_bytes;
             memory.workspace_bytes += rank.workspace_bytes;
@@ -771,6 +829,16 @@ struct Executor::Impl {
 
     ~Impl() {
         draft_prefetch.reset();
+        // The copier's queued copies finish before the events and buffers they use go.
+        for (auto& prefetch : prefetches) {
+            for (auto& buffer : prefetch.buffers) {
+                if (!buffer.issued.valid()) { continue; }
+                try {
+                    buffer.issued.get();
+                } catch (...) {}
+            }
+        }
+        pool_copier.reset();
         // A pass that failed between starting the row reads and waiting for them leaves them
         // writing into a staging buffer.
         if (table) {
@@ -973,6 +1041,23 @@ struct Executor::Impl {
         }
         current.head = true;
         segments.push_back(current);
+        // Launch-sized pieces; a boundary writes the stack before the next layer reads it, the
+        // rounding the fused write-read takes (hyper_connection_write_read).
+        std::vector<Segment> pieces;
+        for (const Segment& segment : segments) {
+            Segment piece = segment;
+            while (piece.end - piece.begin > kSegmentLayers) {
+                Segment first = piece;
+                first.end     = piece.begin + kSegmentLayers;
+                first.head    = false;
+                pieces.push_back(first);
+                piece.begin = first.end;
+                piece.embed = false;
+                piece.rows  = false;
+            }
+            pieces.push_back(piece);
+        }
+        segments = std::move(pieces);
     }
 
     [[nodiscard]] std::size_t workspace_bytes(std::size_t rank) const {
@@ -1192,29 +1277,119 @@ struct Executor::Impl {
         CUDA_CHECK(cudaStreamSynchronize(ranks[0].stream));
     }
 
-    // A sparse-attention layer's per-sequence state: paged KV (one plane per K or V vector and
-    // per scale, each [leading, page, head, page]), pooled keys and the indexer's tail.
-    void allocate_attention_state(LayerState& state, std::size_t rank) {
-        const auto plane = [&](std::int32_t leading, DType dtype) {
-            return DeviceBuffer(std::uint64_t(leading) * kPagedKVPageSize *
-                                config.num_key_value_heads * pages * dtype_size(dtype));
-        };
-        state.k_pages = plane(kv_layout.key.data_leading_extent, kv_layout.key.data_dtype);
-        state.v_pages = plane(kv_layout.value.data_leading_extent, kv_layout.value.data_dtype);
-        if (kv_layout.key.has_scale()) {
-            state.k_scales = plane(kv_layout.key.scale_leading_extent, kv_layout.key.scale_dtype);
+    // The planes of the sparse-attention layers' KV storage, in LayerState::kv's order (K, V,
+    // K scales, V scales), each a row width and dtype; absent scale planes have width 0.
+    [[nodiscard]] std::array<std::pair<std::int32_t, DType>, 4> kv_planes() const {
+        return {{{kv_layout.key.data_leading_extent, kv_layout.key.data_dtype},
+                 {kv_layout.value.data_leading_extent, kv_layout.value.data_dtype},
+                 {kv_layout.key.has_scale() ? kv_layout.key.scale_leading_extent : 0,
+                  kv_layout.key.scale_dtype},
+                 {kv_layout.value.has_scale() ? kv_layout.value.scale_leading_extent : 0,
+                  kv_layout.value.scale_dtype}}};
+    }
+
+    // One plane's bytes for `pages` pages of `page_tokens` positions.
+    [[nodiscard]] std::uint64_t kv_plane_bytes(std::size_t plane, std::uint64_t page_tokens,
+                                               std::uint64_t count) const {
+        const auto [leading, dtype] = kv_planes()[plane];
+        return std::uint64_t(leading) * page_tokens * config.num_key_value_heads * count *
+               dtype_size(dtype);
+    }
+
+    // A view of a sparse-attention layer's KV planes `data(i)`: pages of `page_tokens` positions,
+    // `count` of them, read through `table` (`entries` I32).
+    template <class Data>
+    [[nodiscard]] PagedKVLayerView kv_view(Data&& data, std::int32_t page_tokens,
+                                           std::int32_t count, void* table,
+                                           std::int32_t entries) const {
+        PagedKVLayerView cache{};
+        Tensor* targets[4] = {&cache.k_pages, &cache.v_pages, &cache.k_scale_pages,
+                              &cache.v_scale_pages};
+        const auto planes = kv_planes();
+        for (std::size_t i = 0; i < planes.size(); ++i) {
+            if (planes[i].first == 0) { continue; }
+            *targets[i] = Tensor(data(i), planes[i].second,
+                                 {planes[i].first, page_tokens,
+                                  static_cast<std::int32_t>(config.num_key_value_heads), count});
         }
-        if (kv_layout.value.has_scale()) {
-            state.v_scales =
-                plane(kv_layout.value.scale_leading_extent, kv_layout.value.scale_dtype);
+        cache.block_table  = Tensor(table, DType::I32, {entries});
+        cache.head_dim     = static_cast<std::int32_t>(config.head_dim);
+        cache.num_kv_heads = static_cast<std::int32_t>(config.num_key_value_heads);
+        cache.storage      = options.kv_cache;
+        return cache;
+    }
+
+    // A sparse-attention layer's per-sequence state: paged KV (one plane per K or V vector and
+    // per scale, each [leading, page, head, page]), pooled keys and the indexer's tail. A
+    // streamed layer keeps the paged KV in pinned host memory, and its pool and map on the device.
+    void allocate_attention_state(LayerState& state, std::size_t rank) {
+        std::uint64_t device_kv = 0, bytes = 0;
+        const auto planes       = kv_planes();
+        for (std::size_t i = 0; i < planes.size(); ++i) {
+            if (planes[i].first == 0) { continue; }
+            KvPlane& plane = state.kv[i];
+            plane.bytes    = kv_plane_bytes(i, kPagedKVPageSize, pages);
+            if (stream_slots != 0) {
+                plane.host    = std::make_unique<PinnedHostBuffer>(plane.bytes);
+                plane.p       = plane.host->data();
+                state.pool[i] = DeviceBuffer(kv_plane_bytes(i, ops::kKvStreamPageTokens,
+                                                            stream_slots));
+                device_kv += state.pool[i].bytes;
+                memory.host_kv_bytes += plane.bytes;
+            } else {
+                plane.device = DeviceBuffer(plane.bytes);
+                plane.p      = plane.device.p;
+                device_kv += plane.bytes;
+            }
+        }
+        if (stream_slots != 0) {
+            const auto blocks = static_cast<std::int32_t>(
+                std::uint64_t(pages) * (kPagedKVPageSize / ops::kKvStreamPageTokens));
+            const auto slots  = static_cast<std::int32_t>(stream_slots);
+            state.map_memory  = DeviceBuffer(ops::kv_stream_map_bytes(blocks, slots));
+            state.map         = ops::kv_stream_map(state.map_memory.p, blocks, slots);
+            bytes += state.map_memory.bytes;
         }
         state.pooled = DeviceBuffer(std::uint64_t(config.indexer_head_dim) * pooled_slots * 4);
         state.tail   = DeviceBuffer(std::uint64_t(config.indexer_head_dim) *
                                     (config.indexer_compress_ratio - 1) * 4);
-        const std::uint64_t kv =
-            state.k_pages.bytes + state.v_pages.bytes + state.k_scales.bytes + state.v_scales.bytes;
-        memory.ranks[rank].state_bytes += kv + state.pooled.bytes + state.tail.bytes;
-        memory.kv_bytes += kv;
+        memory.ranks[rank].state_bytes += device_kv + bytes + state.pooled.bytes + state.tail.bytes;
+        memory.kv_bytes += device_kv;
+    }
+
+    // Streamed layers: each rank that runs one gets the staging copy a prompt chunk reads.
+    void allocate_staging() {
+        if (stream_slots == 0) { return; }
+        for (RankState& rank : ranks) {
+            const bool attention =
+                std::any_of(layers.begin(), layers.end(), [&](const LayerPlan& plan) {
+                    return plan.qsa && plan.rank == rank.rank;
+                }) ||
+                (mtp && rank.rank == model.head_rank());
+            if (!attention) { continue; }
+            RankBinding bind(device, rank.rank);
+            const auto planes = kv_planes();
+            for (std::size_t i = 0; i < planes.size(); ++i) {
+                if (planes[i].first == 0) { continue; }
+                rank.kv_staging[i] = DeviceBuffer(kv_plane_bytes(i, kPagedKVPageSize, pages));
+                memory.ranks[rank.rank].workspace_bytes += rank.kv_staging[i].bytes;
+            }
+        }
+    }
+
+    // Before a prompt chunk of a streamed layer: the rank's staging copy holds the layer's
+    // positions before `first`, copied from its host copy unless the copy is still there from the
+    // layer's previous chunk.
+    void stage(const LayerState& state, RankState& rank, std::uint32_t first) {
+        if (rank.kv_staged == &state && rank.kv_staged_end >= first) { return; }
+        const std::uint64_t used = (std::uint64_t(first) + kPagedKVPageSize - 1) / kPagedKVPageSize;
+        for (std::size_t i = 0; i < state.kv.size(); ++i) {
+            const KvPlane& plane = state.kv[i];
+            if (plane.p == nullptr || used == 0) { continue; }
+            CUDA_CHECK(cudaMemcpyAsync(rank.kv_staging[i].p, plane.p, plane.bytes / pages * used,
+                                       cudaMemcpyDefault, rank.stream));
+        }
+        rank.kv_staged = &state;
     }
 
     // Each rank's Gated DeltaNet layers keep their state in one pool with a slot per sequence,
@@ -1492,16 +1667,23 @@ struct Executor::Impl {
                                                     .up     = bank(plan->moe.up),
                                                     .down   = bank(plan->moe.down)});
         }
-        cache = std::make_unique<ExpertCache>(device, std::move(cache_layers), bytes);
+        // The routing profile: the one given, else the one recorded on this family's release.
+        std::vector<std::size_t> widths;
+        for (const auto& [plan, moe] : expert) { widths.push_back(plan->moe.gate.pointers.size()); }
+        std::optional<ExpertRouteCounts> profile;
+        if (!options.hybrid_experts.routing_profile.empty()) {
+            profile = read_expert_profile(options.hybrid_experts.routing_profile,
+                                          model.info().artifact_id, widths);
+        } else {
+            profile = builtin_expert_profile(kExpertProfileFamily, widths);
+        }
+        cache = std::make_unique<ExpertCache>(device, std::move(cache_layers), bytes,
+                                              profile ? &*profile : nullptr,
+                                              expert.size() > layers.size());
         for (std::size_t r = 0; r < bytes.size(); ++r) {
             memory.ranks[r].expert_cache_bytes += bytes[r];
         }
-        if (!options.hybrid_experts.routing_profile.empty()) {
-            std::vector<std::size_t> widths;
-            for (const auto& [plan, moe] : expert) { widths.push_back(plan->moe.gate.pointers.size()); }
-            cache->seed(read_expert_profile(options.hybrid_experts.routing_profile,
-                                            model.info().artifact_id, widths));
-        }
+        if (profile) { cache->seed(*profile); }
         if (staged) { allocate_misses(); }
     }
 
@@ -1549,8 +1731,8 @@ struct Executor::Impl {
         }
         MissOptions miss;
         miss.token_capacity = kVectorTokens;
-        miss.cpu_balance    = options.hybrid_experts.dma_share_auto;
-        miss.cpu_share      = miss.cpu_balance ? 0.0 : 1.0 - double(options.hybrid_experts.dma_share);
+        miss.cpu_balance    = !options.hybrid_experts.dma_share && !options.hybrid_experts.mapped_misses;
+        miss.cpu_share      = miss.cpu_balance ? 0.0 : 1.0 - double(options.hybrid_experts.dma_share.value_or(1.0F));
         miss.cpu_threads    = options.hybrid_experts.cpu_threads;
         miss.staging_bytes  = kStagingBytes;
         miss.tail_skip_rank = options.hybrid_experts.tail_skip_rank;
@@ -1561,10 +1743,15 @@ struct Executor::Impl {
     }
 
     // One slot per expert on every rank, sized for its layers' widest projections, when half the
-    // free memory holds them, and with --expert-prefill-buffers 2 a second such buffer when half
-    // holds both; the expert cache takes what is left.
+    // free memory holds them, and a second such buffer when half holds both and two are wanted:
+    // --expert-prefill-buffers 2, or by default with the automatic expert cache, which holds both
+    // between prompts. The expert cache takes what is left.
     void allocate_slot_pools() {
         const std::size_t experts = config.num_experts;
+        const std::uint32_t wanted =
+            options.hybrid_experts.prefill_buffers != 0 ? options.hybrid_experts.prefill_buffers
+            : options.expert_cache_bytes == ExecutorOptions::kAutoExpertCache ? 2
+                                                                               : 1;
         slot_pools.resize(device.size());
         for (std::size_t r = 0; r < device.size(); ++r) {
             std::array<std::uint64_t, 3> widest{};
@@ -1587,8 +1774,7 @@ struct Executor::Impl {
             const std::uint64_t bytes = pool.offset[2] + round_up(experts * widest[2] + kSlotTail);
             if (bytes > free_bytes / 2) { continue; }
             pool.slots = static_cast<std::uint32_t>(experts);
-            pool.buffers.resize(
-                options.hybrid_experts.prefill_buffers == 2 && 2 * bytes <= free_bytes / 2 ? 2 : 1);
+            pool.buffers.resize(wanted == 2 && 2 * bytes <= free_bytes / 2 ? 2 : 1);
             for (auto& buffer : pool.buffers) {
                 buffer.storage = DeviceBuffer(bytes);
                 CUDA_CHECK(cudaMemset(buffer.storage.p, 0, buffer.storage.bytes));
@@ -1615,6 +1801,7 @@ struct Executor::Impl {
                 CUDA_CHECK(cudaEventCreateWithFlags(&copied, cudaEventDisableTiming));
                 CUDA_CHECK(cudaEventRecord(copied, device.rank(r).transfer_stream));
             }
+            if (!pool_copier) { pool_copier = std::make_unique<HostWorkerPool>(1, 4); }
         }
     }
 
@@ -1685,10 +1872,32 @@ struct Executor::Impl {
         return index < layers.size() && layers[index].rank == rank && !layers[index].moe.native;
     }
 
-    // Copies every expert of text layer `index` that the cache lacks into its pool buffer, on the
-    // transfer stream once the buffer's previous call is done with it, and points the buffer's
-    // tables at the cache or the copies.
+    // Has the copier copy every expert of text layer `index` that the cache lacks into its pool
+    // buffer (issue_prefetch), which then receives the layer.
     void prefetch_layer(std::size_t index) {
+        auto& target  = prefetches[layers[index].rank].buffers[pool_buffer(index)];
+        target.layer  = index;
+        target.issued = pool_copier->submit([this, index] { issue_prefetch(index); });
+    }
+
+    // Before a call waits for a buffer's ready event: the copier has recorded it. Rethrows the
+    // copier's failure.
+    static void await_prefetch(PoolPrefetch::Buffer& buffer) {
+        if (buffer.issued.valid()) { buffer.issued.get(); }
+    }
+
+    // Waits until the copier has issued every queued layer.
+    void drain_prefetches() {
+        for (auto& prefetch : prefetches) {
+            for (auto& buffer : prefetch.buffers) { await_prefetch(buffer); }
+        }
+    }
+
+    // On the copier thread: once the last call that read layer `index`'s pool buffer is done with
+    // it, copies every expert of the layer that the cache lacks into the buffer on the transfer
+    // stream and points the buffer's tables at the cache or the copies. Waiting on the host keeps
+    // copies that cannot run yet out of the stream's queue.
+    void issue_prefetch(std::size_t index) {
         const LayerPlan& plan = layers[index];
         SlotPool& pool        = slot_pools[plan.rank];
         PoolPrefetch& state   = prefetches[plan.rank];
@@ -1696,7 +1905,7 @@ struct Executor::Impl {
         auto& target          = state.buffers[b];
         RankBinding bind(device, plan.rank);
         const cudaStream_t t  = device.rank(plan.rank).transfer_stream;
-        CUDA_CHECK(cudaStreamWaitEvent(t, target.free, 0));
+        CUDA_CHECK(cudaEventSynchronize(target.free));
         const MoePlan& m          = plan.moe;
         const std::size_t experts = m.gate.pointers.size();
         const auto source         = std::size_t(state.next);
@@ -1708,11 +1917,26 @@ struct Executor::Impl {
                                    cudaMemcpyHostToDevice, t));
         CUDA_CHECK(cudaEventRecord(state.copied[source], t));
         CUDA_CHECK(cudaEventRecord(target.ready, t));
-        target.layer = index;
+    }
+
+    // Before a pass: a wide one takes the pool buffers back from the expert cache, a decode or
+    // verification pass returns them.
+    void place_pools(bool wide) {
+        if (!pools_lent) { return; }
+        for (std::size_t r = 0; r < slot_pools.size(); ++r) {
+            if (slot_pools[r].slots == 0) { continue; }
+            const cudaStream_t transfer = device.rank(r).transfer_stream;
+            if (wide) {
+                cache->reclaim(r, transfer);
+            } else {
+                cache->give_back(r, transfer);
+            }
+        }
     }
 
     // Forgets every prefetched layer, so the next wide call copies its own.
     void forget_prefetches() {
+        drain_prefetches();
         for (auto& prefetch : prefetches) {
             for (auto& buffer : prefetch.buffers) { buffer.layer = ~std::size_t{0}; }
         }
@@ -1731,24 +1955,23 @@ struct Executor::Impl {
         const auto* host = static_cast<const std::int32_t*>(route_host->data());
         if (cache) {
             const std::size_t used = std::size_t(config.num_experts_per_tok) * pending_routes;
+            // The tier learns from decode and verification passes; a prompt chunk, which routes
+            // nearly every expert, only counts toward the statistics.
+            const bool decode = pending_routes <= std::uint32_t(kVectorTokens);
             if (pending_routes > 0) {
                 for (std::size_t i = 0; i < layers.size(); ++i) {
-                    cache->observe(i, std::span(host + i * pairs, used), pending_routes);
+                    cache->observe(i, std::span(host + i * pairs, used), decode);
                 }
             }
             if (mtp_routes > 0) {
                 cache->observe(layers.size(),
                                std::span(host + layers.size() * pairs,
                                          std::size_t(config.num_experts_per_tok) * mtp_routes),
-                               mtp_routes);
+                               true);
             }
-            // A prompt chunk moves the working set; a decode step only nudges it.
-            // A span of several chunks earns each chunk's budget.
-            cache->rebalance(pending_routes > 1 ? (2048ULL << 20) * pending_chunks : (48ULL << 20),
-                             pending_routes > kVectorTokens);
+            if (decode) { cache->adapt(); }
         }
         pending_routes = 0;
-        pending_chunks = 1;
         mtp_routes     = 0;
     }
 
@@ -1812,6 +2035,23 @@ struct Executor::Impl {
                 CUDA_CHECK(cudaMemsetAsync(buffer->p, 0, buffer->bytes, stream));
             }
         }
+        forget_streamed_kv(sequence);
+    }
+
+    // A sequence's streamed layers: every block leaves their pools, and no rank's staging copy
+    // stands for them, after a reset or a loaded image rewrote what their positions hold.
+    void forget_streamed_kv(SequenceState& sequence) {
+        if (stream_slots == 0) { return; }
+        const auto forget = [&](LayerState& state, std::size_t rank) {
+            if (state.map.table == nullptr) { return; }
+            RankBinding bind(device, rank);
+            ops::kv_stream_reset(state.map, ranks[rank].stream);
+            if (ranks[rank].kv_staged == &state) { ranks[rank].kv_staged = nullptr; }
+        };
+        for (std::size_t i = 0; i < layers.size(); ++i) {
+            forget(sequence.layers[i], layers[i].rank);
+        }
+        if (mtp) { forget(sequence.mtp, model.head_rank()); }
     }
 
     // Moves the stack's first `tokens` columns from one rank to another, ordered after the
@@ -1857,7 +2097,10 @@ struct Executor::Impl {
         table->prefetch(rows);
     }
 
-    void stage_inputs(std::span<const Part> parts, std::span<const std::int32_t> tokens) {
+    // Stages a pass's inputs. With `read_rows` it also starts reading the tokens' n-gram rows into
+    // the rows' staging (stage_rows uploads them); without, the rows' ids stay in row_ids.
+    void stage_inputs(std::span<const Part> parts, std::span<const std::int32_t> tokens,
+                      bool read_rows = true) {
         const auto t            = static_cast<std::int32_t>(tokens.size());
         const std::size_t c     = options.prefill_chunk;
         // Host side first: positions (sequence indices and RoPE positions), the n-gram rows of the
@@ -1943,7 +2186,7 @@ struct Executor::Impl {
             upload(rank.rope, 8 * c, rope);
             if (!scatter.empty() && rank.rank == 0) { upload(rank.scatter, 12 * c, scatter); }
             if (mrope) { upload(rank.mrope, 16 * c, mrope_positions); }
-            if (table && rank.rank == rows_rank) {
+            if (table && read_rows && rank.rank == rows_rank) {
                 // The rows are read while the layers before the PLE layer run; stage_rows()
                 // uploads them and marks the staging buffer free.
                 table->submit(row_ids, staged_rows(rank, row_ids.size() * row_b));
@@ -1952,7 +2195,7 @@ struct Executor::Impl {
             const bool ple_here =
                 std::any_of(layers.begin(), layers.end(),
                             [&](const LayerPlan& p) { return p.ple && p.rank == rank.rank; });
-            if (!ple_here) { CUDA_CHECK(cudaEventRecord(rank.staged, rank.stream)); }
+            if (!ple_here || !read_rows) { CUDA_CHECK(cudaEventRecord(rank.staged, rank.stream)); }
         }
     }
 
@@ -1970,20 +2213,7 @@ struct Executor::Impl {
     void stage_rows(RankState& rank) {
         const std::size_t bytes = row_ids.size() * ops::ngram_row_bytes(options.ngram->format);
         RankState& reader       = ranks[rows_rank];
-        if (!rows_waited) {
-            StallEvents& events = stall_events[stall_next];
-            stall_next          = (stall_next + 1) % stall_events.size();
-            if (events.wanted == nullptr) {
-                CUDA_CHECK(cudaEventCreate(&events.wanted));
-                CUDA_CHECK(cudaEventCreate(&events.ready));
-            }
-            measure_stall(events, true);
-            CUDA_CHECK(cudaEventRecord(events.wanted, reader.stream));
-            table->wait();
-            rows_waited = true;
-            CUDA_CHECK(cudaEventRecord(events.ready, reader.stream));
-            events.pending = true;
-        }
+        await_rows(reader);
         std::span<std::uint8_t> rows = staged_rows(reader, bytes);
         if (&rank != &reader) {
             const auto own = staged_rows(rank, bytes);
@@ -1993,6 +2223,24 @@ struct Executor::Impl {
         CUDA_CHECK(
             cudaMemcpyAsync(rank.rows, rows.data(), bytes, cudaMemcpyHostToDevice, rank.stream));
         CUDA_CHECK(cudaEventRecord(rank.staged, rank.stream));
+    }
+
+    // Waits for the rows being read, unless already waited for, between a pair of stall events on
+    // the reading rank's stream.
+    void await_rows(RankState& reader) {
+        if (rows_waited) { return; }
+        StallEvents& events = stall_events[stall_next];
+        stall_next          = (stall_next + 1) % stall_events.size();
+        if (events.wanted == nullptr) {
+            CUDA_CHECK(cudaEventCreate(&events.wanted));
+            CUDA_CHECK(cudaEventCreate(&events.ready));
+        }
+        measure_stall(events, true);
+        CUDA_CHECK(cudaEventRecord(events.wanted, reader.stream));
+        table->wait();
+        rows_waited = true;
+        CUDA_CHECK(cudaEventRecord(events.ready, reader.stream));
+        events.pending = true;
     }
 
     // Adds a finished wait to the stall counters; `block` waits for it to finish.
@@ -2123,6 +2371,7 @@ struct Executor::Impl {
         const std::int32_t* rope      = nullptr; // 1-D RoPE positions
         void* index                   = nullptr; // BF16 [640, count]
         void* tail                    = nullptr; // FP32 [128, 3]
+        std::uint32_t first           = 0;       // the first position, as the host knows it
     };
 
     [[nodiscard]] AttentionInputs target_inputs(std::size_t index, LayerState& state,
@@ -2130,7 +2379,8 @@ struct Executor::Impl {
         AttentionInputs in{.positions = rank.positions + part.column,
                            .rope      = rank.rope + part.column,
                            .index     = nullptr,
-                           .tail      = state.tail.p};
+                           .tail      = state.tail.p,
+                           .first     = part.sequence->position};
         if (verifying) {
             const std::uint64_t rows =
                 std::uint64_t(config.indexer_n_heads + 1) * config.indexer_head_dim;
@@ -2185,31 +2435,31 @@ struct Executor::Impl {
             const Tensor rope(const_cast<std::int32_t*>(in.rope), DType::I32, {t});
             ops::rmsnorm_rope(rope, a.query_norm, a.key_norm, q3, k3, qo, ko, s);
         }
-        const auto plane = [&](const DeviceBuffer& memory, std::int32_t leading, DType dtype) {
-            return Tensor(memory.p, dtype,
-                          {leading, static_cast<std::int32_t>(kPagedKVPageSize), nk,
-                           static_cast<std::int32_t>(pages)});
-        };
-        PagedKVLayerView cache{};
-        cache.k_pages =
-            plane(state.k_pages, kv_layout.key.data_leading_extent, kv_layout.key.data_dtype);
-        cache.v_pages =
-            plane(state.v_pages, kv_layout.value.data_leading_extent, kv_layout.value.data_dtype);
-        if (kv_layout.key.has_scale()) {
-            cache.k_scale_pages = plane(state.k_scales, kv_layout.key.scale_leading_extent,
-                                        kv_layout.key.scale_dtype);
-        }
-        if (kv_layout.value.has_scale()) {
-            cache.v_scale_pages = plane(state.v_scales, kv_layout.value.scale_leading_extent,
-                                        kv_layout.value.scale_dtype);
-        }
-        cache.block_table =
-            Tensor(rank.block_table.p, DType::I32, {static_cast<std::int32_t>(pages)});
-        cache.head_dim     = d;
-        cache.num_kv_heads = nk;
-        cache.storage      = options.kv_cache;
+        // The paged KV: device pages, or a streamed layer's host copy. A streamed layer's call of
+        // at most stream_width tokens reads its device pool once kv_stream_resolve has made the
+        // call's blocks resident there; a wider call (a prompt chunk) reads the rank's staging
+        // copy, into which it appends as well, and then drops the blocks it wrote from the pool.
+        const auto paged_count = static_cast<std::int32_t>(pages);
+        const PagedKVLayerView cache =
+            kv_view([&](std::size_t i) { return state.kv[i].p; }, kPagedKVPageSize, paged_count,
+                    rank.block_table.p, paged_count);
+        const bool streamed = state.map.table != nullptr;
+        const bool pooled_read = streamed && t <= static_cast<std::int32_t>(stream_width);
         const Tensor v3(v.data, DType::BF16, {d, nk, t});
         ops::kv_cache_append(ko, v3, positions, cache, s);
+        PagedKVLayerView read = cache;
+        if (pooled_read) {
+            if (rank.kv_staged == &state) { rank.kv_staged = nullptr; }
+            read = kv_view([&](std::size_t i) { return state.pool[i].p; }, ops::kKvStreamPageTokens,
+                           static_cast<std::int32_t>(stream_slots), state.map.table,
+                           state.map.blocks);
+        } else if (streamed) {
+            stage(state, rank, in.first);
+            read = kv_view([&](std::size_t i) { return rank.kv_staging[i].p; }, kPagedKVPageSize,
+                           paged_count, rank.block_table.p, paged_count);
+            ops::kv_cache_append(ko, v3, positions, read, s);
+            rank.kv_staged_end = in.first + std::uint32_t(t);
+        }
         const auto di = static_cast<std::int32_t>(config.indexer_head_dim);
         Tensor pooled(state.pooled.p, DType::FP32, {di, static_cast<std::int32_t>(pooled_slots)});
         Tensor tail(in.tail, DType::FP32,
@@ -2226,11 +2476,21 @@ struct Executor::Impl {
             ops::qsa_indexer_select(index, first, iw, config.rms_norm_eps, pooled, ws, selected,
                                     counts, s);
         }
+        if (pooled_read) {
+            ops::kv_stream_resolve(state.map, first, selected, counts, cache, read, s);
+        }
         Tensor attention(rank.f, DType::BF16, {d, nq, t});
         {
             auto scope = ws.scope();
-            ops::sparse_softmax_attention(qo, first, selected, counts, cache,
+            ops::sparse_softmax_attention(qo, first, selected, counts, read,
                                           1.0F / std::sqrt(float(d)), ws, attention, s);
+        }
+        if (streamed && !pooled_read) {
+            const auto block = [](std::uint32_t position) {
+                return static_cast<std::int32_t>(position / ops::kKvStreamPageTokens);
+            };
+            ops::kv_stream_evict(state.map, block(in.first),
+                                 block(in.first + std::uint32_t(t) - 1) + 1, s);
         }
         Tensor flat(rank.f, DType::BF16, {d * nq, t});
         ops::sigmoid_mul(gate, flat, s);
@@ -2302,6 +2562,7 @@ struct Executor::Impl {
                 state.buffers[1 - b].layer != index + 1) {
                 prefetch_layer(index + 1);
             }
+            await_prefetch(buffer);
             CUDA_CHECK(cudaStreamWaitEvent(s, buffer.ready, 0));
             ops::GgufMoeWeights banks = plan.moe.banks();
             const auto* table_p       = static_cast<const void* const*>(pool.buffers[b].tables.p);
@@ -2339,6 +2600,7 @@ struct Executor::Impl {
         const std::size_t experts = m.gate.pointers.size();
         // The copies below overwrite the first buffer, so no buffer holds a prefetched layer.
         if (!prefetches.empty()) {
+            drain_prefetches();
             for (auto& buffer : prefetches[rank.rank].buffers) { buffer.layer = ~std::size_t{0}; }
         }
         std::vector<char> routed(experts, 0);
@@ -2588,10 +2850,10 @@ struct Executor::Impl {
                 throw std::invalid_argument("qwen4_exp forward: the sequence exceeds max_context");
             }
         }
-        fence_misses();
         settle_routes();
         // A copy queued for an earlier pass may predate the cache's last swaps.
         forget_prefetches();
+        place_pools(t > kVectorTokens);
         if (hybrid) { hybrid->begin(cancelled, !warming); }
         stage_inputs(parts, tokens);
         // Disk-resident experts need the host between a layer's routing and its experts, so their
@@ -2633,27 +2895,11 @@ struct Executor::Impl {
             }
         }
         record_routes(static_cast<std::uint32_t>(t));
-        if (misses) {
-            for (std::size_t r = 0; r < ranks.size(); ++r) {
-                RankBinding bind(device, r);
-                misses->publish(ranks[r].stream, r);
-            }
-        }
         // While a staged layer waits on the device for its missing experts, no other launch may
         // load a kernel lazily: loading can wait for the device to go idle, the waiting kernel for
         // the misses' service, and the service's own calls for the loader. The caller's next
         // kernels therefore follow a pass that may have waited.
         if (misses && t <= kVectorTokens) { synchronize_ranks(); }
-    }
-
-    // Slots taken behind the last pass's calls are filled before anything later on the streams,
-    // this pass and the cache's rebalance, touches them.
-    void fence_misses() {
-        if (!misses) { return; }
-        for (std::size_t r = 0; r < ranks.size(); ++r) {
-            RankBinding bind(device, r);
-            misses->fence(ranks[r].stream, r);
-        }
     }
 
     void synchronize_ranks() {
@@ -2701,6 +2947,7 @@ struct Executor::Impl {
             span_row_bytes = std::size_t(config.ngram_heads()) *
                              ops::ngram_row_bytes(options.ngram->format);
             span_rows      = DeviceBuffer(std::size_t(tokens) * span_row_bytes);
+            span_host_rows = std::make_unique<PinnedHostBuffer>(span_rows.bytes);
             bytes += span_rows.bytes;
         }
         span_group = planned_group_chunks();
@@ -2807,16 +3054,26 @@ struct Executor::Impl {
         const auto count_of = [&](std::size_t k) {
             return static_cast<std::int32_t>(std::min(c, n - k * c));
         };
-        fence_misses();
         settle_routes();
         forget_prefetches();
+        place_pools(true);
         float* const own_stack = rank.stack;
         // The chunks' inputs, staged one after another as forward() stages them, kept in the
-        // span planes; their embeddings start their stacks.
+        // span planes; their embeddings start their stacks. The span's n-gram rows are read in
+        // one batch while the layers before the first PLE layer run.
+        const bool reads_rows =
+            table && std::any_of(segments.begin(), segments.end(),
+                                 [](const Segment& segment) { return segment.rows; });
+        const std::size_t heads = config.ngram_heads();
+        if (reads_rows) { span_row_ids.resize(n * heads); }
         for (std::size_t k = 0; k < chunks; ++k) {
             const std::int32_t t = count_of(k);
             const Part part{.sequence = &sequence, .column = 0, .count = t};
-            stage_inputs(std::span(&part, 1), tokens.subspan(k * c, std::size_t(t)));
+            stage_inputs(std::span(&part, 1), tokens.subspan(k * c, std::size_t(t)), false);
+            if (reads_rows) {
+                std::copy(row_ids.begin(), row_ids.end(),
+                          span_row_ids.begin() + std::ptrdiff_t(k * c * heads));
+            }
             Tensor mixed(rank.mixed, DType::BF16, {h, t});
             ops::embedding(Tensor(rank.ids, DType::I32, {t}), embedding_table, mixed, st);
             Tensor stack(chunk_stack(k), DType::FP32, {h, hc, t});
@@ -2826,17 +3083,15 @@ struct Executor::Impl {
                                        cudaMemcpyDeviceToDevice, st));
             CUDA_CHECK(cudaMemcpyAsync(static_cast<std::int32_t*>(span_rope.p) + k * c, rank.rope,
                                        std::size_t(t) * 4, cudaMemcpyDeviceToDevice, st));
-            if (table && std::any_of(segments.begin(), segments.end(),
-                                     [](const Segment& segment) { return segment.rows; })) {
-                stage_rows(rank);
-                CUDA_CHECK(cudaMemcpyAsync(static_cast<std::byte*>(span_rows.p) +
-                                               k * c * span_row_bytes,
-                                           rank.rows, std::size_t(t) * span_row_bytes,
-                                           cudaMemcpyDeviceToDevice, st));
-            }
             sequence.position += std::uint32_t(t);
         }
         sequence.position = start;
+        if (reads_rows) {
+            table->submit(span_row_ids,
+                          std::span(static_cast<std::uint8_t*>(span_host_rows->data()),
+                                    n * span_row_bytes));
+            rows_waited = false;
+        }
         // The next step's rows are read while the device runs this span.
         hint_next(sequence, next);
         void* const own_mixed   = rank.mixed;
@@ -2853,6 +3108,11 @@ struct Executor::Impl {
             for (std::size_t i = 0; i < layers.size(); ++i) {
                 const LayerPlan& plan = layers[i];
                 LayerState& state     = sequence.layers[i];
+                if (plan.ple && !rows_waited) {
+                    await_rows(rank);
+                    CUDA_CHECK(cudaMemcpyAsync(span_rows.p, span_host_rows->data(),
+                                               n * span_row_bytes, cudaMemcpyHostToDevice, st));
+                }
                 for (std::size_t k = 0; k < chunks; ++k) {
                     const std::int32_t t = count_of(k);
                     const Part part{.sequence = &sequence, .column = 0, .count = t};
@@ -2884,7 +3144,10 @@ struct Executor::Impl {
                     if (plan.gdn) {
                         run_gdn(plan, i, state, rank, part);
                     } else {
-                        run_qsa(plan, state, rank, part, target_inputs(i, state, rank, part));
+                        // The span holds the sequence at its start; chunk k begins k chunks on.
+                        AttentionInputs in = target_inputs(i, state, rank, part);
+                        in.first           = start + std::uint32_t(k * c);
+                        run_qsa(plan, state, rank, part, in);
                     }
                     {
                         auto scope = rank.workspace->scope();
@@ -2943,8 +3206,6 @@ struct Executor::Impl {
             project(head, head_mixed, logits, *rank.workspace, st);
             sequence.position = start + std::uint32_t(n);
             record_routes(last_count);
-            // Up to four chunks' admission budget: more delays the first decode step.
-            pending_chunks = std::min<std::size_t>(chunks, 4);
             // The MTP block catches up chunk by chunk over each chunk's own final stacks.
             if (mtp) {
                 for (std::size_t k = 0; k < chunks; ++k) {
@@ -3073,6 +3334,22 @@ struct Executor::Impl {
         for (std::size_t r = 0; r < added.size(); ++r) {
             memory.ranks[r].expert_cache_bytes += added[r];
             memory.expert_cache_bytes += added[r];
+        }
+        std::vector<ExpertCache::Loan> loans;
+        for (std::size_t r = 0; r < slot_pools.size(); ++r) {
+            for (const auto& buffer : slot_pools[r].buffers) {
+                loans.push_back({.rank = r, .base = buffer.storage.p, .bytes = buffer.storage.bytes});
+            }
+        }
+        if (!loans.empty()) {
+            const auto lent = cache->lend(loans);
+            for (std::size_t r = 0; r < lent.size(); ++r) {
+                memory.ranks[r].expert_cache_bytes += lent[r];
+                memory.ranks[r].workspace_bytes -= lent[r];
+                memory.expert_cache_bytes += lent[r];
+                memory.workspace_bytes -= lent[r];
+            }
+            pools_lent = true;
         }
         if (misses) {
             for (std::size_t i = 0; i < expert_layers().size(); ++i) {
@@ -3204,7 +3481,8 @@ struct Executor::Impl {
                     {.positions = positions + part.column,
                      .rope      = positions + part.column,
                      .index     = nullptr,
-                     .tail      = drafting ? sequence.mtp_scratch_tail.p : sequence.mtp.tail.p});
+                     .tail      = drafting ? sequence.mtp_scratch_tail.p : sequence.mtp.tail.p,
+                     .first     = part.first});
         }
         mrope = media;
         {
@@ -3410,6 +3688,9 @@ struct Executor::Impl {
         } else {
             chain();
         }
+        // The expert cache takes the last verification's routes while the device drafts; the
+        // table uploads it queues follow the draft on the stream, before the next pass.
+        settle_routes();
         auto* host = static_cast<std::int32_t*>(mtp_staging->data());
         CUDA_CHECK(cudaMemcpyAsync(host, ids + b, k * b * 4, cudaMemcpyDeviceToHost, rank.stream));
         auto* logprobs = reinterpret_cast<float*>(host + mtp_ids.bytes / 4);
@@ -3631,7 +3912,7 @@ struct Executor::Impl {
         sequence.rope_delta = 0;
     }
 
-    // One device region of a sequence image, on its rank.
+    // One region of a sequence image, on its rank: device memory, or a streamed layer's host copy.
     struct ImageRegion {
         void* device      = nullptr;
         std::size_t bytes = 0;
@@ -3650,10 +3931,9 @@ struct Executor::Impl {
             (std::uint64_t(position) + kPagedKVPageSize - 1) / kPagedKVPageSize;
         const std::uint64_t blocks = position / config.indexer_compress_ratio;
         const auto attention       = [&](const LayerState& state, std::size_t rank) {
-            for (const DeviceBuffer* plane :
-                 {&state.k_pages, &state.v_pages, &state.k_scales, &state.v_scales}) {
-                if (plane->p == nullptr) { continue; }
-                out.push_back({plane->p, std::size_t(plane->bytes / pages * used), rank});
+            for (const KvPlane& plane : state.kv) {
+                if (plane.p == nullptr) { continue; }
+                out.push_back({plane.p, std::size_t(plane.bytes / pages * used), rank});
             }
             out.push_back(
                 {state.pooled.p, std::size_t(config.indexer_head_dim) * 4 * blocks, rank});
@@ -3687,18 +3967,30 @@ struct Executor::Impl {
         return bytes;
     }
 
-    // Copies between a sequence image's regions and host memory (to the host when `save`) on the
-    // regions' streams, and waits for the copies.
-    void copy_image(const std::vector<ImageRegion>& regions, std::byte* host, bool save) {
-        std::size_t offset = 0;
+    // Copies between a sequence image's regions and host pages (to the host when `save`) on the
+    // regions' streams, and waits for the copies. The image runs through the pages in order, each
+    // holding `page_bytes` of it.
+    void copy_image(const std::vector<ImageRegion>& regions, std::span<std::byte* const> pages,
+                    std::size_t page_bytes, bool save) {
+        std::uint64_t total = 0;
+        for (const ImageRegion& region : regions) { total += region.bytes; }
+        if (page_bytes == 0 || pages.size() < (total + page_bytes - 1) / page_bytes) {
+            throw std::invalid_argument("qwen4_exp image: the pages do not hold the image");
+        }
+        std::uint64_t at = 0;
         for (const ImageRegion& region : regions) {
-            if (region.bytes == 0) { continue; }
             RankBinding bind(device, region.rank);
-            CUDA_CHECK(cudaMemcpyAsync(
-                save ? static_cast<void*>(host + offset) : region.device,
-                save ? region.device : static_cast<void*>(host + offset), region.bytes,
-                save ? cudaMemcpyDeviceToHost : cudaMemcpyHostToDevice, ranks[region.rank].stream));
-            offset += region.bytes;
+            auto* device_bytes = static_cast<std::byte*>(region.device);
+            for (std::size_t left = region.bytes; left > 0;) {
+                const std::size_t in_page = std::min<std::size_t>(left, page_bytes - at % page_bytes);
+                std::byte* host           = pages[at / page_bytes] + at % page_bytes;
+                CUDA_CHECK(cudaMemcpyAsync(save ? static_cast<void*>(host) : device_bytes,
+                                           save ? static_cast<void*>(device_bytes) : host, in_page,
+                                           cudaMemcpyDefault, ranks[region.rank].stream));
+                device_bytes += in_page;
+                left -= in_page;
+                at += in_page;
+            }
         }
         for (auto& rank : ranks) {
             RankBinding bind(device, rank.rank);
@@ -3707,30 +3999,27 @@ struct Executor::Impl {
     }
 
     SequenceImage save_image(std::uint32_t s, const SequenceSnapshot* at,
-                             std::span<std::byte> out) {
+                             std::span<std::byte* const> pages, std::size_t page_bytes) {
         const SequenceState& sequence = sequences.at(s);
         if (at != nullptr && (at->layers.size() != layers.size() || (mtp && at->mtp.size() != 2))) {
             throw std::invalid_argument("qwen4_exp image: the snapshot holds no state");
         }
         const std::uint32_t position = at != nullptr ? at->position : sequence.position;
-        const auto regions           = image_regions(sequence, at, position);
-        if (out.size() != image_bytes(position)) {
-            throw std::invalid_argument("qwen4_exp image: the buffer does not fit the image");
-        }
-        copy_image(regions, out.data(), true);
+        copy_image(image_regions(sequence, at, position), pages, page_bytes, true);
         return SequenceImage{.position = position,
                              .context  = at != nullptr ? at->context : sequence.context,
                              .mtp_follows =
                                  mtp && (at != nullptr ? at->mtp_follows : sequence.mtp_follows)};
     }
 
-    void load_image(std::uint32_t s, const SequenceImage& image, std::span<const std::byte> bytes) {
+    void load_image(std::uint32_t s, const SequenceImage& image,
+                    std::span<std::byte* const> pages, std::size_t page_bytes) {
         SequenceState& sequence = sequences.at(s);
-        if (image.position > options.max_context || bytes.size() != image_bytes(image.position)) {
+        if (image.position > options.max_context) {
             throw std::invalid_argument("qwen4_exp image: the image does not fit the sequence");
         }
-        copy_image(image_regions(sequence, nullptr, image.position),
-                   const_cast<std::byte*>(bytes.data()), false);
+        copy_image(image_regions(sequence, nullptr, image.position), pages, page_bytes, false);
+        forget_streamed_kv(sequence);
         sequence.position    = image.position;
         sequence.context     = image.context;
         sequence.mtp_follows = mtp && image.mtp_follows;
@@ -3821,13 +4110,13 @@ std::uint64_t Executor::image_bytes(std::uint32_t position) const {
 }
 
 SequenceImage Executor::save_image(std::uint32_t sequence, const SequenceSnapshot* at,
-                                   std::span<std::byte> out) {
-    return impl_->save_image(sequence, at, out);
+                                   std::span<std::byte* const> pages, std::size_t page_bytes) {
+    return impl_->save_image(sequence, at, pages, page_bytes);
 }
 
 void Executor::load_image(std::uint32_t sequence, const SequenceImage& image,
-                          std::span<const std::byte> bytes) {
-    impl_->load_image(sequence, image, bytes);
+                          std::span<std::byte* const> pages, std::size_t page_bytes) {
+    impl_->load_image(sequence, image, pages, page_bytes);
 }
 
 void Executor::set_media(std::uint32_t sequence, std::span<const MediaItem> items,

@@ -87,6 +87,8 @@ enum class KvCapacityMode : std::uint8_t {
 };
 
 inline constexpr std::size_t kDefaultKvCapacityHeadroomBytes = 1024ULL * 1024ULL * 1024ULL;
+// Flash-Next's default for EngineOptions::kv_resident_positions with host or disk experts.
+inline constexpr std::uint32_t kDefaultKvResidentPositions = 32768;
 
 struct KvCapacityPolicy {
     KvCapacityMode mode                  = KvCapacityMode::Explicit;
@@ -155,6 +157,13 @@ struct SpeculativeOptions {
     // its query instead of the whole history; target verification keeps full attention, so the
     // committed tokens do not depend on it. Zero reads the whole history.
     std::uint32_t mtp_attention_window = 0;
+    // The backend was left to the Engine (no --spec): a MoE model with host or disk experts whose
+    // artifact carries its MTP block or assistant (Qwen3.8-Flash-Next, Gemma 4) drafts with it,
+    // kAutomaticDraftTokens a round, since a verification window's routes share the layer's
+    // missing experts; others run without drafts. The Engine's options() report the resolved
+    // backend.
+    bool automatic = false;
+    static constexpr std::uint32_t kAutomaticDraftTokens = 3;
 };
 
 enum class StartupPhase : std::uint8_t {
@@ -493,8 +502,8 @@ struct ModelSuspendOptions {
 enum class ExpertResidency : std::uint8_t {
     // In the weight arena of each layer's stage device.
     Device,
-    // In host RAM: native experts copy misses into a device cache; an explicit DMA share below
-    // one enables experimental CPU compute. GGUF GPU kernels read uncached pinned bytes.
+    // In host RAM: experts the device cache lacks are copied to the GPU or computed on the CPU
+    // (HybridExpertOptions).
     Host,
     // Left in the artifact's files and copied into a device cache when a pass routes to them,
     // through the OS page cache: the least host memory, at the cost of a wait for every expert a
@@ -502,16 +511,17 @@ enum class ExpertResidency : std::uint8_t {
     Disk,
 };
 
-// Flash-Next host and disk experts: how a decode or verification call gets the routed experts the
-// device cache lacks. By default every miss executes on the GPU; a DMA share below one lets the CPU
-// compute the rest: for GGUF banks the GPU's results bit for bit, for native banks different
-// numerical results (and concurrency one).
+// Host and disk experts: how a decode or verification call gets the routed experts the device
+// cache lacks. The GPU copies a share of them and the CPU computes the rest: for GGUF banks
+// (Flash-Next, Gemma 4) and Qwen3.5/3.6 MoE experts the GPU's results bit for bit, for Flash-Next
+// native banks different numerical results (and concurrency one).
 struct HybridExpertOptions {
-    float dma_share = 1; // 0..1 of distinct uncached experts per decode/verify call
-    // GGUF experts: each call splits its misses between copies and the CPU by measured speeds
-    // instead of a fixed share (dma_share is then unused).
-    bool dma_share_auto = false;
-    std::uint32_t cpu_threads = 0; // automatic, or 1..256
+    // Host or disk experts: the share 0..1 of a decode or verification call's missing experts the
+    // GPU copies; the CPU computes the rest. Unset (default): where the CPU's products are the
+    // GPU's bit for bit (GGUF and Qwen3.5/3.6 MoE experts), each call splits its misses by
+    // measured CPU and bus times; Flash-Next native experts copy every miss.
+    std::optional<float> dma_share;
+    std::uint32_t cpu_threads = 0; // automatic (one per physical core, half the CPUs), or 1..256
     // GGUF banks: copy missing experts into device staging while the cached ones run (staged), or
     // let the expert kernels read host experts across the bus (mapped; host experts only).
     bool mapped_misses = false;
@@ -521,8 +531,10 @@ struct HybridExpertOptions {
     std::uint32_t tail_skip_rank = 0;
     // GGUF host experts: device buffers a wide prefill call copies its layer's uncached experts
     // into. 2 copies the next layer's while this layer's experts run, and takes the second
-    // buffer's memory from the expert cache; 1 (default) keeps one.
-    std::uint32_t prefill_buffers = 1;
+    // buffer's memory from the expert cache; 1 keeps one. 0 (default) takes two with the automatic
+    // expert cache, which holds both between prompts, and one with an explicit cache size. Two
+    // fall back to one when half the free memory does not hold them.
+    std::uint32_t prefill_buffers = 0;
     bool adaptive_cache = false;
     std::filesystem::path routing_profile; // initial per-layer expert counts for this artifact
     std::filesystem::path record_profile; // write accumulated counts at request boundaries
@@ -599,6 +611,12 @@ struct EngineOptions {
     HybridExpertOptions hybrid_experts;
     // Qwen3.8-Flash-Next only.
     NgramTableOptions ngram_table;
+    // Qwen3.8-Flash-Next only: positions of each sparse-attention layer's KV a sequence keeps in
+    // device memory. A longer context streams those layers: their KV lives in pinned host memory
+    // and the device keeps the blocks the indexer selected most recently, which leaves the rest
+    // of the device memory to the expert cache. Unset: kDefaultKvResidentPositions with host or
+    // disk experts, every position with device experts; 0 keeps every position.
+    std::optional<std::uint32_t> kv_resident_positions;
     std::uint32_t max_context          = 2048; // Logical ceiling of one request or score window.
     // Past the model's native window (max_position_embeddings), up to four times it: positions run
     // unscaled RoPE, or with rope_yarn the whole window takes Qwen's YaRN at factor
