@@ -8,6 +8,7 @@
 #include "core/startup.h"
 #include "core/device.h"
 #include <cuda_runtime.h>
+#include "ninfer/ops/softmax_attention.h"
 #include "ninfer/ops/target_logprobs.h"
 
 #include <algorithm>
@@ -158,13 +159,38 @@ make_stage_runtime(DeviceContext& device, const execution::Parameters& parameter
     const StageLinkOptions control{.slot_bytes   = stage_control_bytes(columns),
                                    .slots        = 2,
                                    .force_staged = force_staged};
+    for (std::size_t stage = 1; stage < stages; ++stage) {
+        runtime->control.emplace_back(device, 0, stage, control);
+    }
+    if (text.tensor_parallel()) {
+        // Rank 0 hands every rank the pass's residual; the layers' sums keep the replicas equal.
+        for (std::size_t rank = 1; rank < stages; ++rank) {
+            runtime->forward.emplace_back(device, 0, rank, residual);
+        }
+        auto& tp  = runtime->tensor_parallel.emplace();
+        tp.shares = text.tensor_shares;
+        for (const TensorShare& share : tp.shares) {
+            tp.shards.push_back(
+                qwen3_5::tensor_parallel_share(parameters.model.config().text, share));
+        }
+        // A position-split attention exchanges its partial outputs through the same slots.
+        std::size_t values = hidden;
+        if (!tp.shares.empty() && tp.shares.front().attention_positions) {
+            const auto& attention = *parameters.model.config().text.attention;
+            values                = std::max<std::size_t>(
+                values, ops::causal_attention_partial_elements(
+                            static_cast<std::int32_t>(attention.num_attention_heads), 1));
+        }
+        tp.exchange = std::make_unique<TensorParallelExchange>(
+            device, TensorParallelExchangeOptions{.slot_bytes   = columns * values * sizeof(float),
+                                                  .force_staged = force_staged});
+        for (std::size_t rank = 1; rank < stages; ++rank) { tp.joined.emplace_back(device.rank(rank)); }
+        return runtime;
+    }
     for (std::size_t stage = 0; stage + 1 < stages; ++stage) {
         runtime->forward.emplace_back(device, stage, stage + 1, residual);
     }
     runtime->back.emplace(device, stages - 1, 0, residual);
-    for (std::size_t stage = 1; stage < stages; ++stage) {
-        runtime->control.emplace_back(device, 0, stage, control);
-    }
     // A masked drafter reads target features from layers that may sit on later stages; such a stage
     // sends each tapped layer's output to rank 0 as soon as the layer has run, on a stream of its
     // own, so the transfer overlaps the stage's later layers.
@@ -261,7 +287,8 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
       shared_prefix_states(shared_prefix_capacity), shared_prefix_slots(shared_prefix_capacity),
       experts(std::move(expert_runtime)),
       round_host(plan.causal_scoring ? std::nullopt
-                                     : std::make_optional<PinnedHostBuffer>(sizeof(TokenId))),
+                                     : std::make_optional<PinnedHostBuffer>(
+                                           kMaximumConcurrency * sizeof(TokenId))),
       score_logprobs_host(plan.causal_scoring ? std::make_optional<PinnedHostBuffer>(
                                                     kCausalScoreTile * sizeof(float))
                                               : std::nullopt),

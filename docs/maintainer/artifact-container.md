@@ -317,6 +317,8 @@ group size、scale 类型和解码规则直接由该 codec 定义。
 | bf16 | Bfloat16 原始 word |
 | fp32 | IEEE binary32 原始 word |
 | int32 | 有符号 32-bit 整数 |
+| fp16 | IEEE binary16 原始 word |
+| uint16 | 无符号 16-bit word |
 | q2_g64_fp16 | Offset codes `0..3` represent `[-1,2]`，G64，signed finite FP16 multiplier |
 | q4_g64_fp16 | Signed 4-bit codes，G64，FP16 multiplier |
 | q5_g64_fp16 | Signed 5-bit codes，G64，FP16 multiplier |
@@ -337,7 +339,7 @@ Code 范围、特殊浮点值、舍入与精确重建按[数值合同](tensor-fo
 
 | 名称 | 当前允许的 format / shape | 对象对齐 |
 |---|---|---:|
-| contiguous_le_v1 | bf16/fp32/int32，rank 0..16 | 256 |
+| contiguous_le_v1 | bf16/fp32/int32/fp16/uint16，rank 0..16 | 256 |
 | row_split_k128_v1 | q2_g64_fp16、q4_g64_fp16、q5_g64_fp16、q6_g64_fp16、q8_g32_fp16、t2_g128_fp16，正 rank-2 `[N,K]` | 256 |
 | block_scale_k16_m128x4_v1 | nvfp4，`N%128=0`、`K%64=0` | 256 |
 | row_scale_v1 | fp8_e4m3fn_row_bf16，正 rank-2 `[N,K]` | 256 |
@@ -575,6 +577,11 @@ I/O 层可将这些段继续切成传输块，按原偏移写入同一个目标�
 不参与复制；跨文件数据通过上述范围映射交给 materializer。
 
 Materializer 按实际使用的 parent 去重，安排 device/host backing，再取得 typed view。
+留在 host 的字节（pinned 块中的对象，以及尚未读取的 Host/Registered 对象）先于 device 对象读取：
+各段合并为 4096-byte 对齐的区间，切成 16 MiB 的块，由 8 个线程各自用对齐的 staging 做 direct
+I/O 读取，再复制到目标位置，不经过 page cache。Pinned 块是普通匿名页（`HostPages`），由这些
+复制在多个线程上缺页分配，读完后整体注册一次；`cudaHostAlloc` 在单线程上清零并锁定同样大小的
+内存要慢数倍。Device 对象经 pinned staging 以 direct I/O 上传。
 辅助 scalar、索引等需要 owning Host 值的用途可以按 Binding 读取对应元素区间，保持其数值类型。
 Reader 的 JSON 与符号索引用于冷加载，运行时使用解析后的引用与直接调用。
 

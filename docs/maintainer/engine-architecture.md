@@ -24,7 +24,7 @@ Generation purpose 的 NInfer Engine 固定运行：
 - 一张 GPU，或 Linux 上按层切成最多八个 pipeline stage 的多张 GPU（见第 8 节）；
 - 一个常驻模型实例；
 - 启动时确定的 `max_concurrency=1..8`；
-- 一个有界 FIFO 等待队列；
+- 一个有界 FIFO 等待队列（等待中的单 token 读取请求之间按剩余工作量交换位置，见 5.2）；
 - 不抢占已经激活的请求；
 - 每个 decode round 将全部 decode-ready 请求组成一个紧凑批次。
 
@@ -53,7 +53,11 @@ inactive cache 的保留而丢失完成能力。
 `Qwen3_5MoeForCausalLM`；训练实例和物理权重分配作为数据进入对应实现。Qwen3.8-Flash-Next
 （`Qwen4ExpForCausalLM`，`models/qwen4_exp`）是第二个显式模型族：它有自己的 load、executor 和
 Engine core（`runtime/engine/qwen4_exp_core`），共享 Qwen3.5 的 Frontend 与 Vision tower，并通过同一个
-公共 `ninfer::Engine` 服务请求。
+公共 `ninfer::Engine` 服务请求。Gemma 4 26B-A4B（`Gemma4ForCausalLM`，`models/gemma4`）、Flint
+（`FlintForCausalLM`，`models/flint`）与 DeepSeek-V4.1-Flash（`DeepseekV41ForCausalLM`，
+`models/deepseek_v41`）是另外三个显式模型族：各自拥有 load、executor 与 Engine core
+（`runtime/engine/gemma4_core`、`flint_core`、`deepseek_v41_core`），以各自的方言共享 Qwen3.5 的
+Frontend，只在一个 GPU 上运行。
 
 V3 artifact 保存配置、物理对象、逻辑参数的 Binding、使用位置的 Use，以及 Frontend 资源。
 Converter 负责源映射、量化或保值导入、融合存储、packing 和 layout 转换；loader 根据实际绑定
@@ -369,6 +373,10 @@ Session key 只是查找提示，不拥有 continuation。每个请求进入 Eng
 Scheduler 先确定唯一可尝试的 waiting request，ResourceManager 再为它选择缓存与资源终态。
 资源条件不能反向改变 FIFO 所有权。
 
+每次 admission 尝试前，Scheduler 按 PrefillOnly（arXiv 2505.07203）的规则重排等待中的单 token
+请求（决策读取）：它们只在彼此占有的队列位置之间交换，按 prompt token 数（含分支）减去已等待时间
+折算的 token 数（每秒 4096）升序，长读取不会被饿死；其他请求位置不变；存在 protected head 时不重排。
+
 FIFO head 暂时受 active incumbents 阻塞时，Scheduler 记录 protected head 和必须结束的 donor set。
 后续请求只有在 Program 证明以下条件时才能 backfill：
 
@@ -382,13 +390,24 @@ FIFO head 暂时受 active incumbents 阻塞时，Scheduler 记录 protected hea
 
 Scheduler 保证：
 
-- staged prefill 按 lane 持有；prefill unit 每次 worker boundary 只推进一个 lane 的一个
-  chunk（剩余 prompt 最短的可运行 lane；被跳过 `kPrefillMaxSkip` 次的 lane 优先），lane 在其
-  staged prefill 完成、settle 或 cancel 时从集合中清除。默认情况下 staged prefill 期间不进行
-  admission，因此同时最多一个 staged-prefill request；启用
-  `concurrent_prefill`（`--concurrent-prefill`）后，由于 prefill 不持有 resource transaction，
-  admission 可以在其它 request prefill 期间进行（仍受 open global topology transition 与 decode
-  连续性的门控），多个 request 可以同时处于 staged-prefill 状态；
+- staged prefill 按 lane 持有；prefill unit 每次 worker boundary 推进一个 lane 的一个
+  chunk（剩余 prompt 最短的可运行 lane；被跳过 `kPrefillMaxSkip` 次的 lane 优先）。若该 chunk
+  是 prompt 的最后一段且可共享（`Program::prefill_batch_unit`：纯文本、段内无 capture、exact
+  tap 或 drafter 工作；带 grammar 的 request 以其 lane 采样记录中的首个 mask 采样自己的行），
+  其它 staged lane 同样可共享的最后一段在合计不超过
+  `prefill_chunk` 时并入同一次 pass（`Program::prefill_batch`），随后各 lane 按 lane 顺序各自
+  完成 prefill step。分支读取（`Engine::submit_branches`）的 step 总以这种 pass 运行，但 pass
+  只含它自己的 segment（前缀的最后一段与分支块），不并入其它 lane，因此它的答案不取决于同时
+  运行的其它请求。lane 在其 staged prefill 完成、settle 或 cancel 时从集合中清除。默认情况下
+  staged prefill 期间不进行 admission，除非每个 staged prefill 都只剩可共享的最后一段：此时新
+  request 被接纳并可加入同一次 pass。启用 `concurrent_prefill`（`--concurrent-prefill`）后，由于
+  prefill 不持有 resource transaction，admission 可以在其它 request prefill 期间进行（仍受 open
+  global topology transition 与 decode 连续性的门控），多个 request 可以同时处于 staged-prefill
+  状态。admission 门打开时，一个 boundary 接纳所有能立即进入空闲 lane 的等待 request，使同时
+  到达的短 request 共享一次 prefill pass。`Engine::submit_group` 在一次 queue lock 下按序入队
+  一组 request（先为整组预留容量，任一成员出错则整组都不入队），worker 因此在同一 boundary
+  看到整组，而不是先启动第一个、其余在它的 pass 期间才到达（serve 的 decision read 与 rerank
+  window 即如此提交）；
 - 已有 decode work 不会被连续 prefill 饿死：只要有 decode work，每个 prefill unit 之前先运行
   `decode_rounds_per_prefill` 个 decode（或 control）unit（按该 unit 的 token 数相对一个 chunk
   成比例，至少一个；`0` 为 `prefill_chunk / 64`，`1` 为严格交替），短 prompt 因此一轮之后即可
@@ -632,6 +651,7 @@ checkpoint catalog。
 | Program 规划、存储与事务 | `src/models/qwen3_5/program/` |
 | Frontend 与模型状态布局 | `src/models/qwen3_5/frontend/`, `state/` |
 | Qwen3.8-Flash-Next 模型族与其 Engine core | `src/models/qwen4_exp/`, `src/runtime/engine/qwen4_exp_core.*` |
+| Gemma 4、Flint、DeepSeek-V4.1-Flash 模型族与其 Engine core | `src/models/gemma4/`, `src/models/flint/`, `src/models/deepseek_v41/`, `src/runtime/engine/{gemma4,flint,deepseek_v41}_core.*` |
 | 每卡 route profile 与 calibration | `src/runtime/engine/device_profile.*`, `src/calibration/`, `src/ops/common/device_route.*` |
 | device primitives, tensors/views, checked layouts, arenas, graph RAII, physical KV, raw transfers | `src/core/` |
 | generic `.ninfer` framing, descriptors, binding primitives, materialization | `src/artifact/` |
@@ -645,8 +665,12 @@ checkpoint catalog。
 
 这些路径用于定位当前 authority，不把文件拆分固化为外部接口。
 
-`include/ninfer/engine.h` 与 `include/ninfer/types.h` 是 in-tree application 使用的 opaque Engine
-interface 和 owning host values；NInfer 当前不安装或导出 C++ SDK。`include/ninfer/ops/` 是
+`include/ninfer/engine.h` 是 in-tree application 使用的 opaque Engine interface；owning host values
+按领域分布在 `include/ninfer/` 的头文件中：`base.h`、`model_enums.h`、`kv_cache_storage.h`、
+`startup.h`、`engine_options.h`、`request.h` 与 `observability/{execution,resources,snapshot}.h`。
+`types_fwd.h` 声明其中全部 struct、class 与 enum；只按引用、指针使用类型或不使用 enumerator 的头文件包含
+它而非定义头文件。`types.h` 汇总这些头文件，只有 `engine.h` 包含它；其他代码包含定义所用类型的头文件。NInfer 当前不
+安装或导出 C++ SDK。`include/ninfer/ops/` 是
 repository-internal semantic Op contracts。`.ninfer` 是唯一 C++ 产品 artifact，不通过扩展名检测、
 兼容 shim 或第二套产品入口加载其他格式。CLI、server 和 inference benchmark 只通过公共 Engine
 推理；converter 不提供 Python model-inference route。

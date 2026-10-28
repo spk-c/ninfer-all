@@ -25,6 +25,13 @@ from .gguf_blocks import RECIPES as GGUF_RECIPES
 from .gemma4 import ARCHITECTURES as GEMMA4_ARCHITECTURES
 from .gemma4 import RECIPES as GEMMA4_RECIPES
 from .gemma4 import build_model as build_gemma4
+from .flint import ARCHITECTURES as FLINT_ARCHITECTURES
+from .flint import RECIPES as FLINT_RECIPES
+from .flint import build_model as build_flint
+from .deepseek_v41 import ARCHITECTURES as DEEPSEEK_V41_ARCHITECTURES
+from .deepseek_v41 import RECIPES as DEEPSEEK_V41_RECIPES
+from .deepseek_v41 import GGUFShards
+from .deepseek_v41 import build_model as build_deepseek_v41
 from .ternary import RECIPES as TERNARY_RECIPES
 
 
@@ -104,7 +111,7 @@ def _layers(value: str):
 
 def _function(value: str):
     recipes = {**RECIPES, **TERNARY_RECIPES, **GGUF_RECIPES, **QWEN4_EXP_GGUF_RECIPES,
-               **GEMMA4_RECIPES}
+               **GEMMA4_RECIPES, **FLINT_RECIPES, **DEEPSEEK_V41_RECIPES}
     if value in recipes:
         return recipes[value]
     filename, function = _recipe_parts(value)
@@ -154,7 +161,10 @@ def main(argv=None):
         help="comma-separated text,vision,mtp,dflash,dflash2 (default text); for "
         "Qwen3.8-Flash-Next text,ngram (the default: the model with its n-gram table), text (the "
         "model alone, its table read from a table artifact at run time) or ngram (that table "
-        "artifact), and vision or mtp (from --source mtp=MTP.gguf or an HF safetensors subset) beside text",
+        "artifact), and vision or mtp (from --source mtp=MTP.gguf or an HF safetensors subset) beside text; "
+        "for DeepSeek-V4.1 text,engram (the default), text or engram, and dspark (its drafter, from "
+        "--source dspark=DRAFTER.gguf or an STQ pack directory) and vision (its tower, from "
+        "--source vision=MMPROJ.gguf and --source bias_vl=BIAS_VL.safetensors) beside text",
     )
     parser.add_argument(
         "--resource",
@@ -196,6 +206,87 @@ def main(argv=None):
         architectures = base.config.get("architectures") or [None]
         flash_next = architectures[0] in QWEN4_EXP_ARCHITECTURES
         gemma4 = architectures[0] in GEMMA4_ARCHITECTURES
+        flint = architectures[0] in FLINT_ARCHITECTURES
+        if architectures[0] in DEEPSEEK_V41_ARCHITECTURES:
+            components = tuple((args.components or "text,engram").split(","))
+            if args.layers or "engram" not in paths or (
+                    "text" in components and "gguf" not in paths) or (
+                    ("dspark" in components) != ("dspark" in paths)) or (
+                    ("vision" in components) != ("vision" in paths)) or (
+                    ("vision" in paths) != ("bias_vl" in paths)):
+                raise ValueError("DeepSeek-V4.1 converts its text component from --source "
+                                 "gguf=SHARD1.gguf, its Engram table from --source "
+                                 "engram=ENGRAM.gguf, with --components ...,dspark its "
+                                 "drafter from --source dspark=DRAFTER.gguf (or an STQ pack "
+                                 "directory) and with "
+                                 "--components ...,vision its vision tower from --source "
+                                 "vision=MMPROJ.gguf and --source bias_vl=BIAS_VL.safetensors")
+            gguf = (stack.enter_context(GGUFShards(paths["gguf"]))
+                    if "text" in components else None)
+            engram = stack.enter_context(GGUFFile(paths["engram"]))
+            # A directory is an STQ pack whose drafter (mtp.*) the dspark component stores.
+            dspark = None
+            if "dspark" in components:
+                dspark = stack.enter_context(
+                    SafetensorsSource(paths["dspark"]) if Path(paths["dspark"]).is_dir()
+                    else GGUFShards(paths["dspark"]))
+            vision = (stack.enter_context(GGUFFile(paths["vision"]))
+                      if "vision" in components else None)
+            bias_vl = (stack.enter_context(SafetensorsSource(paths["bias_vl"]))
+                       if "vision" in components else None)
+            model = build_deepseek_v41(base, gguf, components=components, dspark=dspark,
+                                       vision=vision, bias_vl=bias_vl,
+                                       resource_overrides=overrides)
+            recipe = Recipe(model)
+            deepseek_sources = ({"base": base, "engram": engram}
+                                | ({"gguf": gguf} if gguf is not None else {})
+                                | ({"dspark": dspark} if dspark is not None else {})
+                                | ({"vision": vision} if vision is not None else {}))
+            _function(args.recipe)(model, recipe, deepseek_sources)
+            if args.override:
+                _function(args.override)(model, recipe, deepseek_sources)
+            source_paths = {"base": {"path": str(args.model)},
+                            "engram": {"path": str(paths["engram"])}}
+            for name in ("gguf", "dspark", "vision", "bias_vl"):
+                if name in paths:
+                    source_paths[name] = {"path": str(paths[name])}
+            report = convert(
+                model, recipe, args.out, name=args.name,
+                provenance={"converter": "ninfer-v3", "recipe": args.recipe,
+                            "sources": source_paths},
+                device=args.device, rows_per_chunk=args.rows_per_chunk,
+                max_file_bytes=args.max_file_bytes,
+                progress=lambda index, total, job: print(
+                    f"[{index+1}/{total}] {job.parameters[0]}"
+                    + (f" (+{len(job.parameters)-1})" if len(job.parameters) > 1 else "")
+                    + f": {job.spec.format} {job.spec.shape}", flush=True))
+            print(f"wrote {args.out}: {report['objects']} objects, {len(report['files'])} files, "
+                  f"{report['seconds']:.1f}s", flush=True)
+            return
+        if flint:
+            if "gguf" not in paths or args.layers or (args.components or "text") != "text":
+                raise ValueError("Flint converts its text component from --source gguf=FILE")
+            gguf = stack.enter_context(GGUFFile(paths["gguf"]))
+            model = build_flint(base, gguf, resource_overrides=overrides)
+            recipe = Recipe(model)
+            flint_sources = {"base": base, "gguf": gguf}
+            _function(args.recipe)(model, recipe, flint_sources)
+            if args.override:
+                _function(args.override)(model, recipe, flint_sources)
+            report = convert(
+                model, recipe, args.out, name=args.name,
+                provenance={"converter": "ninfer-v3", "recipe": args.recipe,
+                            "sources": {"base": {"path": str(args.model)},
+                                        "gguf": {"path": str(paths["gguf"])}}},
+                device=args.device, rows_per_chunk=args.rows_per_chunk,
+                max_file_bytes=args.max_file_bytes,
+                progress=lambda index, total, job: print(
+                    f"[{index+1}/{total}] {job.parameters[0]}"
+                    + (f" (+{len(job.parameters)-1})" if len(job.parameters) > 1 else "")
+                    + f": {job.spec.format} {job.spec.shape}", flush=True))
+            print(f"wrote {args.out}: {report['objects']} objects, {len(report['files'])} files, "
+                  f"{report['seconds']:.1f}s", flush=True)
+            return
         if gemma4:
             wanted = (args.components or "text").split(",")
             if ("gguf" not in paths or args.layers or wanted[0] != "text"

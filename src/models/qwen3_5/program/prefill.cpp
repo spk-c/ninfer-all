@@ -6,6 +6,7 @@
 #include "core/device.h"
 #include "ninfer/ops/gdn_replay.h"
 #include "ninfer/ops/logprob_topk.h"
+#include "ninfer/ops/readout_logprobs.h"
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/scalar.h"
 #include "ninfer/ops/scatter.h"
@@ -93,19 +94,23 @@ PrefillChunkResult prefill_text_chunk(PrefillContext& state, std::span<const Tok
     TextContext card(state.execution.device, state.execution.parameters, state.execution.work,
                      state.text_kv, state.execution.linear_attention, state.execution.io,
                      state.execution.prefill_hidden, state.execution.prefill_chunk,
-                     state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache);
+                     state.text_kv_base,
+                     state.drafter ? state.mtp_kv : qwen3_5::PagedKVCacheView{},
+                     &state.text_cache, state.drafter ? state.mtp_cache : nullptr);
     card.set_stage_runtime(state.execution.stages);
     card.set_expert_runtime(state.execution.experts);
     card.set_rope_yarn(state.execution.rope_yarn);
     card.set_mtp_attention_window(state.execution.mtp_attention_window);
     configure_text_card(card, state.execution, state.sampling, state.state_source_slot,
                         state.state_destination_slot, state.mtp_proposal_extent);
+    card.set_readout(state.readout_count);
     card.set_rewrite_checkpoint_hidden_output(state.rewrite_checkpoint_hidden);
     card.set_prefill_split_frontier(split_frontier ? static_cast<std::int64_t>(*split_frontier)
                                                    : -1);
     if (state.take_layer_ready) { card.set_layer_ready(state.take_layer_ready()); }
+    if (state.first_token) { card.set_first_token_hook(state.first_token); }
     const std::span<const int> prompt(ids.data(), ids.size());
-    if (state.dflash != nullptr) {
+    if (state.dflash != nullptr && state.drafter) {
         DFlashFeatureSink sink = make_dflash_prefill_sink(state);
         return card.prefill_chunk(prompt, state.text_kv_base, nominal_length, finalize_at_end,
                                   sink);
@@ -121,18 +126,21 @@ PrefillChunkResult prefill_multimodal_chunk(PrefillContext& state, const Prepare
     TextContext card(state.execution.device, state.execution.parameters, state.execution.work,
                      state.text_kv, state.execution.linear_attention, state.execution.io,
                      state.execution.prefill_hidden, state.execution.prefill_chunk,
-                     state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache);
+                     state.text_kv_base,
+                     state.drafter ? state.mtp_kv : qwen3_5::PagedKVCacheView{},
+                     &state.text_cache, state.drafter ? state.mtp_cache : nullptr);
     card.set_stage_runtime(state.execution.stages);
     card.set_expert_runtime(state.execution.experts);
     card.set_rope_yarn(state.execution.rope_yarn);
     card.set_mtp_attention_window(state.execution.mtp_attention_window);
     configure_text_card(card, state.execution, state.sampling, state.state_source_slot,
                         state.state_destination_slot, state.mtp_proposal_extent);
+    card.set_readout(state.readout_count);
     card.set_rewrite_checkpoint_hidden_output(state.rewrite_checkpoint_hidden);
     card.set_prefill_split_frontier(split_frontier ? static_cast<std::int64_t>(*split_frontier)
                                                    : -1);
     if (state.take_layer_ready) { card.set_layer_ready(state.take_layer_ready()); }
-    if (state.dflash != nullptr) {
+    if (state.dflash != nullptr && state.drafter) {
         DFlashFeatureSink sink = make_dflash_prefill_sink(state);
         return card.prefill_chunk(prompt, state.text_kv_base, nominal_length, vision,
                                   finalize_at_end, sink);
@@ -177,6 +185,8 @@ void mtp_bridge_multimodal(PrefillContext& state, const PreparedPromptData& prom
                            bridge.rope_position, false, composed_embedding);
 }
 
+static_assert(kMaximumReadoutTokens == static_cast<std::size_t>(ops::kReadoutLogprobsMaximum));
+
 void sample_from_hidden(PrefillContext& state, const Tensor& hidden, std::int32_t absolute_position,
                         std::int32_t purpose) {
     if (hidden.dtype != DType::BF16 ||
@@ -190,6 +200,11 @@ void sample_from_hidden(PrefillContext& state, const Tensor& hidden, std::int32_
             state.execution.device.stream);
     // Before sampling adds the token to the penalty counts.
     gather_logprobs(state.execution, logits.view({logits.ne[0], 1, 1}), state.sampling, nullptr);
+    if (state.readout_count > 0) {
+        ops::readout_logprobs(logits, state.execution.io.readout_ids, state.readout_count,
+                              dimension(state.execution.parameters.model.resources().public_token_count),
+                              state.execution.io.readout_values, state.execution.device.stream);
+    }
     CUDA_CHECK(cudaMemcpyAsync(state.execution.io.pos.data, &absolute_position,
                                sizeof(absolute_position), cudaMemcpyHostToDevice,
                                state.execution.device.stream));
@@ -244,9 +259,10 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
     // on-demand growth never leases pages the request cannot reach.
     request.lease_ceiling =
         std::min(capacity, request_plan.summary.prompt_tokens +
-                               (request_plan.summary.effective_output_tokens == 0
-                                    ? 0U
-                                    : request_plan.summary.effective_output_tokens - 1U));
+                               std::max(request_plan.summary.effective_output_tokens == 0
+                                            ? 0U
+                                            : request_plan.summary.effective_output_tokens - 1U,
+                                        branch_extent(request_plan.branches.get())));
     try {
         const std::uint32_t state_slots = request_plan.demand.active_entitlement.device.state_slots;
         const bool preserving_source =
@@ -718,14 +734,18 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
         ensure_sequence_kv_mapped(sequence, prompt_tokens, backend_materialized);
         request.grammar  = request_plan.grammar;
         request.logprobs = request_plan.logprobs;
+        request.readout_tokens = request_plan.readout_tokens;
+        request.branches       = request_plan.branches;
         install_sampling(sequence, request, request_plan.sampling);
         sequence.rope_delta = staged.prompt.rope_delta;
         set_device_i32(io.rope_delta, sequence.rope_delta);
 
         request.timings              = {};
         request.pending              = {};
-        request.publish_continuation = request_plan.summary.publish_continuation;
+        request.publish_continuation = request_plan.summary.publish_continuation &&
+                                       request_plan.drafting && !request_plan.branches;
         sequence.mtp_draft_count     = 0;
+        sequence.mtp_drafts_pending  = false;
         sequence.tail_hidden_valid   = base == prompt_tokens && sequence.tail_hidden_valid;
         sequence.ledger.swap(materialization_ledger_);
         sequence.prefix_identity.swap(materialization_identity_);
@@ -1032,10 +1052,12 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
             if (speculative_backend == SpeculativeBackend::Mtp) {
                 sequence.mtp_kv_valid = sequence.execution_frontier;
                 if (terminal[row]) {
-                    sequence.mtp_draft_count = 0;
+                    sequence.mtp_draft_count    = 0;
+                    sequence.mtp_drafts_pending = false;
                 } else {
                     const std::int32_t next  = mtp_host_egress->next_extents[row];
-                    sequence.mtp_draft_count = static_cast<std::uint32_t>(next);
+                    sequence.mtp_draft_count    = static_cast<std::uint32_t>(next);
+                    sequence.mtp_drafts_pending = false;
                     for (std::uint32_t step = 0; step < sequence.mtp_draft_count; ++step) {
                         sequence.mtp_drafts[step] =
                             mtp_host_egress->next_drafts[step * max_concurrency + row];
@@ -1100,6 +1122,35 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
     };
     const auto started                    = Clock::now();
     try {
+        if (staged.batched) {
+            // A batched pass has computed the rest of the prompt (advance_prefill_batch), or a
+            // branched read's prompt part and next branches.
+            const RequestControl::Prefill::Batched batched = *staged.batched;
+            staged.batched.reset();
+            processed_prompt_tokens = batched.processed_prompt_tokens;
+            if (!batched.complete) {
+                return runtime::PrefillStepResult{
+                    .summary                 = summary,
+                    .processed_prompt_tokens = reported_tokens(),
+                    .timing                  = timing.finish(),
+                };
+            }
+            host_tokens[0] = batched.token;
+            if (request.logprobs) { round_logprobs[0] = batched.logprob; }
+            if (request.branches == nullptr) {
+                return complete_prefill_step(sequence, request, summary, reported_tokens(), {}, false,
+                                             timing);
+            }
+            // The step's round carries every branch's record; its token is the first branch's,
+            // which no continuation follows.
+            branch_round    = std::move(staged.branch_records);
+            const bool tail = staged.branch_tail;
+            runtime::PrefillStepResult step =
+                complete_prefill_step(sequence, request, summary, reported_tokens(), {}, false, timing);
+            if (!tail) { sequence.tail_hidden_valid = false; }
+            step.round.branches = std::span<const runtime::RawTokenLogprob>(branch_round);
+            return step;
+        }
         if (staged.next_capture < staged.capture_groups.size() &&
             staged.capture_groups[staged.next_capture].frontier == staged.cursor) {
             // A capture before any prefill records the resumed state itself: a shared promotion of
@@ -1119,6 +1170,9 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                 .summary = summary,
                 .timing  = timing.finish(),
             };
+        }
+        if (request.branches != nullptr && staged.cursor >= staged.prompt_tokens) {
+            throw std::logic_error("a branched read's branches run only in shared passes");
         }
         // Prefill attention addresses its KV through the shared step table-row scalars. Another
         // lane's staging or capture can rebind them between this lane's steps, so every step
@@ -1177,6 +1231,33 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
             return hybrid_take_restore_layers(lane);
         };
         arm_logprobs(request.logprobs);
+        schedule_state.readout_count = arm_readout(request.readout_tokens);
+        // The first token leaves the device as soon as it is sampled. The drafter's work on the
+        // prompt's end (its MTP pass or bridge and the initial proposals) finishes behind it, and
+        // the initial drafts are taken when the lane's first round needs them. A Vision prompt's
+        // media and pipeline stages wait for everything.
+        const bool early_token = !staged.vision && stage_runtime == nullptr;
+        bool token_left        = false;
+        const auto send_first_token = [&] {
+            copy_round_token();
+            if (request.logprobs) {
+                fetch_logprobs(1);
+                fetch_readout(schedule_state.readout_count);
+            }
+            first_token_ready->record(device.stream);
+            token_left = true;
+        };
+        if (early_token) {
+            make_early_token_resources();
+            schedule_state.first_token = send_first_token;
+        }
+        // A request without drafting leaves the drafter where its frontier stops it.
+        const auto drafter_at = [&staged](std::uint32_t position) {
+            return !staged.drafter_frontier || position < *staged.drafter_frontier;
+        };
+        if (staged.mtp_bridge == MtpBridgeMode::BeforeSuffix && !drafter_at(staged.base)) {
+            staged.mtp_bridge = MtpBridgeMode::None;
+        }
 
         if (staged.mtp_bridge == MtpBridgeMode::BeforeSuffix) {
             if (staged.cursor != staged.base || staged.base == 0 ||
@@ -1234,7 +1315,9 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                     schedule_state.rewrite_checkpoint_hidden = nullptr;
                 }
 
-                const bool final_candidate = staged.cursor + remaining == staged.prompt_tokens;
+                // A branched read never samples its prompt: its branches run in shared passes.
+                const bool final_candidate = staged.cursor + remaining == staged.prompt_tokens &&
+                                             request.branches == nullptr;
                 const std::optional<std::uint32_t> capture_frontier =
                     staged.next_capture < staged.capture_groups.size()
                         ? std::optional<std::uint32_t>(
@@ -1258,6 +1341,13 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                 if (hybrid_split && (!split_frontier || *hybrid_split < *split_frontier)) {
                     split_frontier = *hybrid_split;
                 }
+                if (staged.drafter_frontier && *staged.drafter_frontier > staged.cursor &&
+                    *staged.drafter_frontier < staged.prompt_tokens &&
+                    (!split_frontier || *staged.drafter_frontier < *split_frontier)) {
+                    split_frontier = *staged.drafter_frontier;
+                }
+                const bool drafter     = drafter_at(staged.cursor);
+                schedule_state.drafter = drafter;
                 execution::PrefillChunkResult result;
                 timing.pause();
                 if (staged.vision) {
@@ -1287,8 +1377,8 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                 remaining -= result.processed_tokens;
                 final_chunk_tokens     = result.processed_tokens;
                 sequence.text_kv_valid = staged.cursor;
-                if (staged.prepare_mtp) { sequence.mtp_kv_valid = staged.cursor; }
-                if (is_masked_draft_backend(speculative_backend)) {
+                if (staged.prepare_mtp && drafter) { sequence.mtp_kv_valid = staged.cursor; }
+                if (is_masked_draft_backend(speculative_backend) && drafter) {
                     sequence.dflash_context_frontier = staged.cursor;
                 }
                 commit_sequence_kv(sequence, sequence.text_kv_valid, backend_kv_valid(sequence));
@@ -1297,7 +1387,10 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                 // an immutable source, close the Fork before potentially freezing a new rewrite.
                 settle_state_fork(sequence);
                 if (hybrid_lane != nullptr && !result.finalized) {
-                    hybrid_after_prefill_chunk(sequence, staged.cursor, staged.prompt_tokens);
+                    // A branched read's frontier is a tap position too (its branches follow it).
+                    hybrid_after_prefill_chunk(sequence, staged.cursor,
+                                               staged.prompt_tokens +
+                                                   (request.branches != nullptr ? 1U : 0U));
                 }
                 const bool reached_capture = capture_frontier && staged.cursor == *capture_frontier;
                 if (reached_capture) {
@@ -1322,7 +1415,7 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
             }
 
             if (!finalized) {
-                if (staged.cursor == staged.prompt_tokens) {
+                if (staged.cursor == staged.prompt_tokens && request.branches == nullptr) {
                     throw std::logic_error("staged prefill reached the prompt without sampling");
                 }
                 staged.elapsed_seconds +=
@@ -1349,7 +1442,8 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                                           ops::kSamplePurposePrefill);
             set_device_i32(io.rope_pos, checked_i32(staged.prompt_tokens, "rope position") +
                                             sequence.rope_delta);
-            if (staged.prepare_mtp) {
+            if (early_token) { send_first_token(); }
+            if (staged.prepare_mtp && drafter_at(staged.base)) {
                 if (staged.mtp_bridge != MtpBridgeMode::AfterExactHit) {
                     throw std::logic_error("zero-suffix MTP reuse has no exact-hit bridge");
                 }
@@ -1366,80 +1460,42 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
             }
         }
 
-        copy_round_token();
-        if (request.logprobs) { fetch_logprobs(1); }
+        if (!token_left) {
+            copy_round_token();
+            if (request.logprobs) {
+                fetch_logprobs(1);
+                fetch_readout(schedule_state.readout_count);
+            }
+        }
+        const std::uint32_t draft_count = staged.prepare_mtp ? staged.initial_mtp_extent : 0U;
         std::array<TokenId, qwen3_5::kMtpDecodeMaximumDrafts> initial_drafts{};
-        if (staged.prepare_mtp && staged.initial_mtp_extent != 0) {
-            CUDA_CHECK(cudaMemcpyAsync(initial_drafts.data(), io.mtp->draft_tokens.data,
-                                       staged.initial_mtp_extent * sizeof(TokenId),
+        const bool drafts_pending = token_left && draft_count != 0;
+        if (drafts_pending) {
+            auto* row = static_cast<TokenId*>(initial_drafts_host->data()) +
+                        static_cast<std::size_t>(sequence.lane) * qwen3_5::kMtpDecodeMaximumDrafts;
+            CUDA_CHECK(cudaMemcpyAsync(row, io.mtp->draft_tokens.data, draft_count * sizeof(TokenId),
                                        cudaMemcpyDeviceToHost, device.stream));
+            initial_drafts_ready[sequence.lane].record(device.stream);
+        } else if (draft_count != 0) {
+            CUDA_CHECK(cudaMemcpyAsync(initial_drafts.data(), io.mtp->draft_tokens.data,
+                                       draft_count * sizeof(TokenId), cudaMemcpyDeviceToHost,
+                                       device.stream));
         }
         timing.begin_wait();
-        device.synchronize();
+        if (token_left) {
+            first_token_ready->synchronize();
+        } else {
+            device.synchronize();
+        }
         timing.end_wait();
         staged.elapsed_seconds += std::chrono::duration<double>(Clock::now() - started).count();
-        const double vision_seconds       = staged.vision ? staged.vision->elapsed_seconds() : 0.0;
-        const std::uint32_t prompt_tokens = staged.prompt_tokens;
-
-        validate_licensed_tokens(std::span<const TokenId>(host_tokens, 1));
-        if (request.logprobs) { round_logprobs[0] = fetched_logprob(0, host_tokens[0]); }
-        if (sequence.ledger.size() != prompt_tokens) {
-            throw std::logic_error("candidate token ledger does not match prompt length");
+        if (request.logprobs) {
+            round_logprobs[0] = fetched_logprob(0, host_tokens[0]);
+            attach_readout(round_logprobs[0], schedule_state.readout_count);
         }
-        sequence.ledger.push_back(host_tokens[0]);
-        sequence.prefix_identity.append_generated(1, sequence.rope_delta);
-        sequence.prefix_digests.append_generated(std::span<const TokenId>(host_tokens, 1),
-                                                 sequence.rope_delta);
-        sequence.text_kv_valid = prompt_tokens;
-        if (staged.prepare_mtp) {
-            if (sequence.mtp_kv_valid != prompt_tokens) {
-                throw std::logic_error("staged MTP prefill did not reach the prompt frontier");
-            }
-            sequence.mtp_draft_count = staged.initial_mtp_extent;
-            std::copy_n(initial_drafts.begin(), staged.initial_mtp_extent,
-                        sequence.mtp_drafts.begin());
-        } else if (is_masked_draft_backend(speculative_backend) &&
-                   sequence.dflash_context_frontier != prompt_tokens) {
-            throw std::logic_error("staged DFlash prefill did not reach the prompt frontier");
-        }
-        sequence.tail_hidden_valid      = true;
-        request.timings.vision_seconds  = vision_seconds;
-        request.timings.prefill_seconds = std::max(0.0, staged.elapsed_seconds - vision_seconds);
-        if (staged.vision) {
-            const execution::VisionOverlayWindowStats overlay = staged.vision->overlay_stats();
-            request.timings.overlay_windows           = overlay.windows;
-            request.timings.overlay_exclusive_windows = overlay.exclusive_windows;
-            request.timings.overlay_window_seconds    = overlay.window_seconds;
-            request.timings.overlay_evict_seconds     = overlay.evict_seconds;
-            request.timings.overlay_restore_seconds   = overlay.restore_seconds;
-            request.timings.overlay_evicted_bytes     = overlay.evicted_bytes;
-            request.timings.overlay_staged_bytes      = overlay.staged_bytes;
-        }
-        staged.prompt.release_all_media_payloads();
-        if (staged.vision) { staged.vision->retire_handoff(); }
-
-        const bool prompt_frontier_capture =
-            staged.next_capture < staged.capture_groups.size() &&
-            staged.capture_groups[staged.next_capture].frontier == prompt_tokens;
-        if (!prompt_frontier_capture) { request.prefill.reset(); }
-        request.pending   = PendingCandidate{.kind          = PendingKind::Begin,
-                                             .base_E        = 0,
-                                             .base_S        = 0,
-                                             .prompt_tokens = prompt_tokens,
-                                             .produced      = 1};
-        request.lifecycle = Lifecycle::Pending;
-        return runtime::PrefillStepResult{
-            .summary = summary,
-            .round   = runtime::GeneratedRound{
-                .tokens   = std::span<const TokenId>(host_tokens, 1),
-                .logprobs = request.logprobs
-                                ? std::span<const runtime::RawTokenLogprob>(round_logprobs.data(), 1)
-                                : std::span<const runtime::RawTokenLogprob>{},
-            },
-            .processed_prompt_tokens = reported_tokens(),
-            .complete                = true,
-            .timing                  = timing.finish(),
-        };
+        return complete_prefill_step(sequence, request, summary, reported_tokens(),
+                                     std::span<const TokenId>(initial_drafts.data(), draft_count),
+                                     drafts_pending, timing);
     } catch (...) {
         timing.begin_wait();
         try {
@@ -1452,5 +1508,382 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
     }
 }
 
+runtime::PrefillStepResult ProgramImpl::complete_prefill_step(
+    SequenceState& sequence, RequestControl& request, const runtime::BeginSummary& summary,
+    std::uint32_t processed_prompt_tokens, std::span<const TokenId> initial_drafts,
+    bool drafts_pending, runtime::ExecutionTimingRecorder& timing) {
+    RequestControl::Prefill& staged   = *request.prefill;
+    const double vision_seconds       = staged.vision ? staged.vision->elapsed_seconds() : 0.0;
+    const std::uint32_t prompt_tokens = staged.prompt_tokens;
+
+    validate_licensed_tokens(std::span<const TokenId>(host_tokens, 1));
+    if (sequence.ledger.size() != prompt_tokens) {
+        throw std::logic_error("candidate token ledger does not match prompt length");
+    }
+    sequence.ledger.push_back(host_tokens[0]);
+    sequence.prefix_identity.append_generated(1, sequence.rope_delta);
+    sequence.prefix_digests.append_generated(std::span<const TokenId>(host_tokens, 1),
+                                             sequence.rope_delta);
+    sequence.text_kv_valid = prompt_tokens;
+    if (staged.prepare_mtp) {
+        if (!staged.drafter_frontier && sequence.mtp_kv_valid != prompt_tokens) {
+            throw std::logic_error("staged MTP prefill did not reach the prompt frontier");
+        }
+        sequence.mtp_draft_count = static_cast<std::uint32_t>(initial_drafts.size());
+        std::copy(initial_drafts.begin(), initial_drafts.end(), sequence.mtp_drafts.begin());
+        sequence.mtp_drafts_pending = drafts_pending;
+    } else if (is_masked_draft_backend(speculative_backend) && !staged.drafter_frontier &&
+               sequence.dflash_context_frontier != prompt_tokens) {
+        throw std::logic_error("staged DFlash prefill did not reach the prompt frontier");
+    }
+    sequence.tail_hidden_valid      = true;
+    request.timings.vision_seconds  = vision_seconds;
+    request.timings.prefill_seconds = std::max(0.0, staged.elapsed_seconds - vision_seconds);
+    if (staged.vision) {
+        const execution::VisionOverlayWindowStats overlay = staged.vision->overlay_stats();
+        request.timings.overlay_windows           = overlay.windows;
+        request.timings.overlay_exclusive_windows = overlay.exclusive_windows;
+        request.timings.overlay_window_seconds    = overlay.window_seconds;
+        request.timings.overlay_evict_seconds     = overlay.evict_seconds;
+        request.timings.overlay_restore_seconds   = overlay.restore_seconds;
+        request.timings.overlay_evicted_bytes     = overlay.evicted_bytes;
+        request.timings.overlay_staged_bytes      = overlay.staged_bytes;
+    }
+    staged.prompt.release_all_media_payloads();
+    if (staged.vision) { staged.vision->retire_handoff(); }
+
+    const bool prompt_frontier_capture =
+        staged.next_capture < staged.capture_groups.size() &&
+        staged.capture_groups[staged.next_capture].frontier == prompt_tokens;
+    if (!prompt_frontier_capture) { request.prefill.reset(); }
+    request.pending   = PendingCandidate{.kind          = PendingKind::Begin,
+                                         .base_E        = 0,
+                                         .base_S        = 0,
+                                         .prompt_tokens = prompt_tokens,
+                                         .produced      = 1};
+    request.lifecycle = Lifecycle::Pending;
+    return runtime::PrefillStepResult{
+        .summary = summary,
+        .round   = runtime::GeneratedRound{
+            .tokens   = std::span<const TokenId>(host_tokens, 1),
+            .logprobs = request.logprobs
+                            ? std::span<const runtime::RawTokenLogprob>(round_logprobs.data(), 1)
+                            : std::span<const runtime::RawTokenLogprob>{},
+        },
+        .processed_prompt_tokens = processed_prompt_tokens,
+        .complete                = true,
+        .timing                  = timing.finish(),
+    };
+}
+
+std::optional<PrefillBatchUnit> ProgramImpl::prefill_batch_unit(std::uint32_t lane) const {
+    if (lane >= max_concurrency || stage_runtime || prefill_hidden.data == nullptr ||
+        !round_host) {
+        return std::nullopt;
+    }
+    const RequestControl& request = requests[lane];
+    if (request.lifecycle != Lifecycle::Prefilling || !request.prefill) { return std::nullopt; }
+    const RequestControl::Prefill& staged = *request.prefill;
+    const SequenceState& sequence         = active_sequence(lane);
+    const bool branched                   = request.branches != nullptr;
+    const std::uint32_t remaining =
+        staged.prompt_tokens - std::min(staged.cursor, staged.prompt_tokens);
+    // A branched read's one capture lies at its prompt frontier and is offered with its Begin.
+    const std::size_t captures_left = staged.capture_groups.size() - staged.next_capture;
+    const bool frontier_capture_only =
+        branched && captures_left == 1 &&
+        staged.capture_groups[staged.next_capture].frontier == staged.prompt_tokens;
+    // Only a text prompt's last chunk with nothing that splits or extends the pass: no capture,
+    // bridge, drafter work or exact tap ahead of the cursor. A grammar's first mask is already in
+    // the lane's sampling record (install_sampling), which the pass samples its row with.
+    if (staged.batched || staged.pending_capture_offer != 0 || staged.vision ||
+        staged.prompt.has_media() || sequence.rope_delta != 0 || remaining > prefill_chunk ||
+        (remaining == 0 && !branched) || (captures_left != 0 && !frontier_capture_only) ||
+        staged.initial_mtp_extent != 0) {
+        return std::nullopt;
+    }
+    if (remaining != 0) {
+        const bool drafter = !staged.drafter_frontier || staged.cursor < *staged.drafter_frontier;
+        if (drafter && speculative_backend != SpeculativeBackend::None) { return std::nullopt; }
+        if (staged.mtp_bridge != MtpBridgeMode::None &&
+            !(staged.mtp_bridge == MtpBridgeMode::BeforeSuffix && staged.drafter_frontier &&
+              staged.base >= *staged.drafter_frontier)) {
+            return std::nullopt;
+        }
+        const HybridLaneState* hybrid_lane = hybrid_ ? &hybrid_lanes_[lane] : nullptr;
+        if (hybrid_lane != nullptr && hybrid_lane->active) {
+            if (hybrid_lane->publish) {
+                for (std::size_t tap = hybrid_lane->next_tap; tap < hybrid_lane->taps.size();
+                     ++tap) {
+                    const runtime::prefix_cache::PlannedTap& planned = hybrid_lane->taps[tap];
+                    if (planned.placement == runtime::prefix_cache::TapPlacement::Exact &&
+                        planned.position > staged.cursor &&
+                        planned.position < staged.prompt_tokens) {
+                        return std::nullopt;
+                    }
+                }
+            }
+        } else {
+            const auto& rewrite_frontiers = staged.prompt.identity.rewrite_execution_frontiers;
+            const auto rewrite_split =
+                std::upper_bound(rewrite_frontiers.begin(), rewrite_frontiers.end(), staged.cursor);
+            if (rewrite_split != rewrite_frontiers.end() && *rewrite_split < staged.prompt_tokens) {
+                return std::nullopt;
+            }
+        }
+    }
+    PrefillBatchUnit unit{
+        .tokens = remaining, .segments = remaining != 0 ? 1U : 0U, .branched = branched};
+    if (branched) {
+        // The branches that fit one pass after the prompt part, in order.
+        for (std::size_t branch = staged.next_branch; branch < request.branches->size(); ++branch) {
+            const auto length =
+                static_cast<std::uint32_t>((*request.branches)[branch].tokens.size());
+            if (length > prefill_chunk - unit.tokens ||
+                unit.segments == execution::kMaximumPrefillSegments) {
+                break;
+            }
+            unit.tokens += length;
+            ++unit.segments;
+        }
+        if (unit.segments == 0) { return std::nullopt; }
+    }
+    return unit;
+}
+
+runtime::ExecutionTiming
+ProgramImpl::advance_prefill_batch(std::span<const std::uint32_t> lanes,
+                                   runtime::ExecutionTiming* failed_timing) {
+    runtime::ExecutionTimingRecorder timing(runtime::ExecutionTimingPhase::Submit, failed_timing);
+    if (lanes.empty() || lanes.size() > max_concurrency) {
+        throw std::invalid_argument("batched prefill needs one to max-concurrency lanes");
+    }
+    std::array<PrefillBatchUnit, kMaximumConcurrency> units{};
+    std::uint64_t seen     = 0;
+    std::uint32_t columns  = 0;
+    std::uint32_t segments = 0;
+    for (std::size_t row = 0; row < lanes.size(); ++row) {
+        const std::uint32_t lane                   = lanes[row];
+        const std::optional<PrefillBatchUnit> unit = prefill_batch_unit(lane);
+        if (!unit || (seen & (1ULL << lane)) != 0) {
+            throw std::logic_error("batched prefill lane cannot join the pass");
+        }
+        seen |= 1ULL << lane;
+        units[row] = *unit;
+        columns += unit->tokens;
+        segments += unit->segments;
+    }
+    if (columns > prefill_chunk || segments > execution::kMaximumPrefillSegments) {
+        throw std::logic_error("batched prefill exceeds one prefill chunk");
+    }
+    const auto started = Clock::now();
+    try {
+        // Each lane's prompt part (its rest of the prompt) and, for a branched read, its next
+        // branches: blocks over the prompt frontier that start from the state the prompt part
+        // leaves and keep nothing.
+        struct LanePass {
+            std::uint32_t prompt    = 0;
+            std::int32_t prompt_end = 0;
+            std::size_t branches    = 0;
+            std::size_t first_row   = 0;
+            StateImageSelectors selectors{};
+        };
+
+        std::array<LanePass, kMaximumConcurrency> passes{};
+        std::vector<execution::PrefillSegment> pass_segments;
+        pass_segments.reserve(segments);
+        std::int32_t column = 0;
+        std::size_t outputs = 0;
+        bool logprobs       = false;
+        for (std::size_t row = 0; row < lanes.size(); ++row) {
+            const std::uint32_t lane              = lanes[row];
+            SequenceState& sequence               = active_sequence(lane);
+            RequestControl& request               = requests[lane];
+            const RequestControl::Prefill& staged = *request.prefill;
+            LanePass& pass                        = passes[row];
+            bind_sequence_kv(sequence);
+            pass.selectors = state_selectors(sequence);
+            pass.prompt    = staged.prompt_tokens - staged.cursor;
+            pass.first_row = outputs;
+            const auto kv_row =
+                static_cast<std::int32_t>(text_kv_addresses->bound_row(sequence.kv->text));
+            const auto* sampling = static_cast<const ops::SamplingConfig*>(
+                sampling_config.slice(1, static_cast<std::int32_t>(lane), 1).data);
+            const bool branched = request.branches != nullptr;
+            if (request.readout_tokens.size() > kMaximumReadoutTokens) {
+                throw std::logic_error("readout token ids exceed the round buffer");
+            }
+            if (pass.prompt != 0) {
+                pass_segments.push_back(execution::PrefillSegment{
+                    .ids                    = std::span<const int>(staged.prompt.token_ids)
+                                                  .subspan(staged.cursor, pass.prompt),
+                    .begin                  = staged.cursor,
+                    .kv_table_row           = kv_row,
+                    .state_source_slot      = pass.selectors.source,
+                    .state_destination_slot = pass.selectors.destination,
+                    .output                 = branched ? execution::SegmentOutput::None
+                                                       : execution::SegmentOutput::Sample,
+                    .sampling               = sampling,
+                    .readout = branched ? std::span<const std::int32_t>{}
+                                        : std::span<const std::int32_t>(request.readout_tokens),
+                });
+                column += static_cast<std::int32_t>(pass.prompt);
+                pass.prompt_end = column;
+                if (!branched) { ++outputs; }
+            }
+            if (branched) {
+                pass.branches = units[row].segments - (pass.prompt != 0 ? 1U : 0U);
+                // A block reads the prompt's state where the prompt part leaves it: the lane's
+                // destination after that part, its read image when the prompt is complete.
+                const std::int32_t block_source =
+                    pass.prompt != 0 ? pass.selectors.destination : pass.selectors.source;
+                std::uint32_t widest = 0;
+                for (std::size_t b = 0; b < pass.branches; ++b) {
+                    const runtime::ReadBranch& branch = (*request.branches)[staged.next_branch + b];
+                    widest = std::max(widest, static_cast<std::uint32_t>(branch.tokens.size()));
+                    if (branch.readout_tokens.size() > kMaximumReadoutTokens) {
+                        throw std::logic_error("branch readout token ids exceed the round buffer");
+                    }
+                    pass_segments.push_back(execution::PrefillSegment{
+                        .ids                    = std::span<const int>(branch.tokens),
+                        .begin                  = staged.prompt_tokens,
+                        .kv_table_row           = kv_row,
+                        .state_source_slot      = block_source,
+                        .state_destination_slot = -1,
+                        .output                 = execution::SegmentOutput::Read,
+                        .sampling               = sampling,
+                        .readout = std::span<const std::int32_t>(branch.readout_tokens),
+                    });
+                    column += static_cast<std::int32_t>(branch.tokens.size());
+                    ++outputs;
+                }
+                // The blocks' K/V rows past the frontier are scratch within the lane's lease.
+                ensure_sequence_kv_mapped(sequence, staged.prompt_tokens + widest, 0);
+            }
+            logprobs = logprobs || request.logprobs;
+            // A Host restore still landing: the shared pass waits for all of its layers.
+            for (const cudaEvent_t ready : hybrid_take_restore_layers(lane)) {
+                CUDA_CHECK(cudaStreamWaitEvent(device.stream, ready, 0));
+            }
+        }
+        mark_workspace_usage(workspace_plan.text_prefill);
+        arm_logprobs(logprobs);
+        constexpr std::size_t rows_capacity = execution::kMaximumPrefillSegments;
+        constexpr auto top_k                = static_cast<std::size_t>(ops::kLogprobTopK);
+        constexpr auto readouts = static_cast<std::size_t>(ops::kReadoutLogprobsMaximum);
+        static_assert(kMaximumReadoutTokens <= readouts);
+        if (!prefill_batch_host) {
+            prefill_batch_host.emplace(rows_capacity *
+                                       (sizeof(std::int32_t) + top_k * sizeof(std::int32_t) +
+                                        top_k * sizeof(float) + readouts * sizeof(float)));
+        }
+        auto* host_base   = static_cast<unsigned char*>(prefill_batch_host->data());
+        auto* out_tokens  = reinterpret_cast<std::int32_t*>(host_base);
+        auto* out_ids     = out_tokens + rows_capacity;
+        auto* out_values  = reinterpret_cast<float*>(out_ids + rows_capacity * top_k);
+        auto* out_readout = out_values + rows_capacity * top_k;
+
+        const SequenceState& first = active_sequence(lanes.front());
+        execution::TextContext card(device, parameters, work, text_kv_view(first),
+                                    state_images->linear(0), io, prefill_hidden, prefill_chunk,
+                                    pass_segments.front().begin, qwen3_5::PagedKVCacheView{},
+                                    &decoder->text_kv, nullptr);
+        card.set_expert_runtime(experts.get());
+        card.set_rope_yarn(rope_yarn);
+        card.set_fast_prefill_kernel(fast_prefill_kernel);
+        card.set_gdn_state_action(execution::GdnStateAction::UpdateInPlace, nullptr);
+        timing.pause();
+        const execution::PrefillChunkResult result =
+            card.prefill_final_batch(std::span<const execution::PrefillSegment>(pass_segments),
+                                     execution::PrefillBatchHost{.tokens     = out_tokens,
+                                                                 .top_ids    = out_ids,
+                                                                 .top_values = out_values,
+                                                                 .readout    = out_readout});
+        timing.include(result.timing);
+        timing.resume_post();
+
+        // A row's logprob record from the pass's host outputs (prefill_final_batch synchronized).
+        const auto record = [&](std::size_t row, std::size_t readout_count) {
+            const auto token = static_cast<TokenId>(out_tokens[row]);
+            runtime::RawTokenLogprob out{.id = token, .logprob = kLogprobSentinel};
+            for (std::size_t k = 0; k < kMaximumTokenLogprobs; ++k) {
+                out.top_ids[k]    = out_ids[row * top_k + k];
+                out.top_values[k] = out_values[row * top_k + k];
+                if (out.top_ids[k] == token) { out.logprob = out.top_values[k]; }
+            }
+            std::copy_n(out_readout + row * readouts, readout_count, out.readout_values.begin());
+            out.readout_count = static_cast<std::uint32_t>(readout_count);
+            return out;
+        };
+
+        // Each prompt part's state and KV now reach its prompt frontier; its continuation hidden
+        // is the part's last column. A branched read's frontier state is the hybrid cache's
+        // explicit tap there.
+        for (std::size_t row = 0; row < lanes.size(); ++row) {
+            const LanePass& pass            = passes[row];
+            SequenceState& sequence         = active_sequence(lanes[row]);
+            RequestControl& request         = requests[lanes[row]];
+            RequestControl::Prefill& staged = *request.prefill;
+            if (pass.prompt == 0) { continue; }
+            staged.cursor          = staged.prompt_tokens;
+            sequence.text_kv_valid = staged.cursor;
+            commit_sequence_kv(sequence, sequence.text_kv_valid, backend_kv_valid(sequence));
+            settle_state_fork(sequence);
+            const Tensor last = prefill_hidden.slice(1, pass.prompt_end - 1, 1);
+            copy_tail(sequence, last);
+            if (request.branches != nullptr) {
+                staged.branch_tail = true;
+                Tensor continuation =
+                    state_images->continuation_hidden_slot(pass.selectors.destination);
+                CUDA_CHECK(cudaMemcpyAsync(continuation.data, last.data, last.bytes(),
+                                           cudaMemcpyDeviceToDevice, device.stream));
+                if (hybrid_) {
+                    hybrid_after_prefill_chunk(sequence, staged.prompt_tokens,
+                                               staged.prompt_tokens + 1U);
+                }
+            }
+        }
+        timing.begin_wait();
+        device.synchronize();
+        timing.end_wait();
+
+        const double elapsed = std::chrono::duration<double>(Clock::now() - started).count();
+        for (std::size_t row = 0; row < lanes.size(); ++row) {
+            const LanePass& pass            = passes[row];
+            RequestControl& request         = requests[lanes[row]];
+            RequestControl::Prefill& staged = *request.prefill;
+            RequestControl::Prefill::Batched batched{.processed_prompt_tokens = pass.prompt};
+            if (request.branches == nullptr) {
+                batched.token = static_cast<TokenId>(out_tokens[pass.first_row]);
+                if (request.logprobs) {
+                    batched.logprob = record(pass.first_row, request.readout_tokens.size());
+                }
+            } else {
+                for (std::size_t b = 0; b < pass.branches; ++b) {
+                    const runtime::ReadBranch& branch = (*request.branches)[staged.next_branch];
+                    staged.branch_records.push_back(
+                        record(pass.first_row + b, branch.readout_tokens.size()));
+                    ++staged.next_branch;
+                }
+                batched.complete = staged.next_branch == request.branches->size();
+                if (batched.complete) {
+                    batched.token   = staged.branch_records.front().id;
+                    batched.logprob = staged.branch_records.front();
+                }
+            }
+            staged.elapsed_seconds += elapsed;
+            staged.batched = batched;
+        }
+        return timing.finish();
+    } catch (...) {
+        timing.begin_wait();
+        try {
+            device.synchronize();
+        } catch (...) {}
+        timing.end_wait();
+        clear_execution_failure_lanes(lanes);
+        throw;
+    }
+}
 
 } // namespace ninfer::models::qwen3_5::detail

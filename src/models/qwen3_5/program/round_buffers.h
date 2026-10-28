@@ -4,7 +4,8 @@
 #include "core/tensor.h"
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/speculative_round.h"
-#include "ninfer/types.h"
+#include "ninfer/base.h"
+#include "ninfer/model_enums.h"
 
 #include <array>
 #include <cstddef>
@@ -193,6 +194,8 @@ struct RoundStateLayout {
     TensorRegion logprob_values;
     TensorRegion logprob_lse;
     TensorRegion logprob_active;
+    TensorRegion readout_ids;
+    TensorRegion readout_values;
     std::optional<MtpPrefillStateLayout> mtp;
     std::optional<DFlashPrefillStateLayout> dflash_prefill;
     std::optional<MtpDecodeStateLayout> mtp_decode;
@@ -354,6 +357,10 @@ struct RoundState {
     Tensor logprob_values;
     Tensor logprob_lse;
     Tensor logprob_active;
+    // The typed readout of a prefill's first token: I32 [kMaximumReadoutTokens] ids a request
+    // named and the FP32 [kMaximumReadoutTokens] log probabilities read for them.
+    Tensor readout_ids;
+    Tensor readout_values;
     std::optional<MtpPrefillState> mtp;
     std::optional<DFlashPrefillState> dflash_prefill;
     std::optional<MtpDecodeState> mtp_decode;

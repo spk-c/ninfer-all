@@ -37,14 +37,30 @@ HANDLE handle(void* value) noexcept { return static_cast<HANDLE>(value); }
 // file; share every access so a Reader behaves the same way on Windows.
 constexpr DWORD kShareMode = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
 
+struct EventHandle {
+    HANDLE value = nullptr;
+    ~EventHandle() {
+        if (value != nullptr) { ::CloseHandle(value); }
+    }
+};
+
 // One positional read. Overlapped I/O carries the offset, so reads on the same handle never share
-// a file pointer; a synchronous handle completes the request inside ReadFile.
+// a file pointer; a synchronous handle completes the request inside ReadFile. An overlapped request
+// waits on an event of its own: without one GetOverlappedResult waits on the file handle, which
+// any completed request on it signals, so a thread whose read was still in flight while another
+// thread's finished would take 0 bytes and leave the read writing into a dead OVERLAPPED.
 DWORD positional_read(HANDLE file, bool overlapped, std::uint64_t offset, std::byte* destination,
                       DWORD count, const std::filesystem::path& path, const char* operation) {
     OVERLAPPED request{};
     request.Offset     = static_cast<DWORD>(offset & 0xffffffffULL);
     request.OffsetHigh = static_cast<DWORD>(offset >> 32U);
-    DWORD read         = 0;
+    EventHandle event;
+    if (overlapped) {
+        event.value = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (event.value == nullptr) { fail(path, "CreateEventW", ::GetLastError()); }
+        request.hEvent = event.value;
+    }
+    DWORD read = 0;
     if (!::ReadFile(file, destination, count, &read, &request)) {
         const DWORD error = ::GetLastError();
         if (error == ERROR_HANDLE_EOF) { return 0; }
@@ -124,6 +140,7 @@ std::size_t InputFile::read_direct(std::uint64_t offset, std::span<std::byte> de
         throw ArtifactError(path_.string() + ": unaligned direct read");
     }
     if (destination.empty()) { return 0; }
+    std::unique_lock lock(direct_open_);
     if (direct_file_ == nullptr) {
         // FILE_FLAG_NO_BUFFERING is the Windows O_DIRECT: sector-aligned offsets, sizes and
         // buffers, which the checks above already guarantee for the 4096-byte payload alignment.
@@ -135,6 +152,7 @@ std::size_t InputFile::read_direct(std::uint64_t offset, std::span<std::byte> de
         if (file == INVALID_HANDLE_VALUE) { fail(path_, "CreateFileW direct", ::GetLastError()); }
         direct_file_ = file;
     }
+    lock.unlock();
     // ReadFile takes a DWORD count; stay a whole number of aligned blocks below 4 GiB.
     constexpr std::size_t kMaximumRequest = 1ULL << 30U;
     std::size_t total                     = 0;
@@ -202,9 +220,13 @@ std::size_t InputFile::read_direct(std::uint64_t offset, std::span<std::byte> de
         throw ArtifactError(path_.string() + ": unaligned or oversized direct read");
     }
     if (destination.empty()) { return 0; }
-    if (direct_fd_ < 0) {
-        direct_fd_ = ::open(path_.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
-        if (direct_fd_ < 0) { fail(path_, "open direct"); }
+    {
+        const std::lock_guard lock(direct_open_);
+        if (direct_fd_ < 0) {
+            const int fd = ::open(path_.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
+            if (fd < 0) { fail(path_, "open direct"); }
+            direct_fd_ = fd;
+        }
     }
     ssize_t read;
     do {

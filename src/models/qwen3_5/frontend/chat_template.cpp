@@ -1,5 +1,7 @@
 #include "models/qwen3_5/frontend/chat_template.h"
 
+#include "models/qwen3_5/frontend/deepseek_output.h"
+#include "models/qwen3_5/frontend/flint_output.h"
 #include "models/qwen3_5/frontend/gemma_output.h"
 #include "models/qwen3_5/frontend/media_cache.h"
 #include "models/qwen3_5/frontend/prompt_layout.h"
@@ -50,6 +52,15 @@ ForcedCallOpener forced_call_opener(ToolCallSyntax syntax) {
         // template's own rendering of an earlier call; the name is the only literal text.
         return {.head = std::string(kGemmaCallOpen) + std::string(kGemmaCallHead),
                 .tail = kGemmaArgumentsOpen};
+    case ToolCallSyntax::Flint:
+        // <tool_call> is a token of Flint's vocabulary; the arguments follow the name directly.
+        return {.head = std::string(kFlintCallOpen), .tail = {}};
+    case ToolCallSyntax::DeepSeek:
+        // The calls block after the closed reasoning, then the call's invoke tag; its parameters
+        // follow on the next line.
+        return {.head = std::string(kDeepSeekCallsSeparator) + std::string(kDeepSeekCallsOpen) +
+                        "\n" + std::string(kDeepSeekInvokeOpen),
+                .tail = "\">\n"};
     }
     throw std::invalid_argument("invalid tool call syntax");
 }
@@ -344,7 +355,14 @@ RenderedChat CompiledChatTemplate::render_as(const std::vector<ChatMessage>& mes
     if (!options.tool_jsons.empty()) {
         context["tools"] = Json::array();
         for (std::size_t i = 0; i < options.tool_jsons.size(); ++i) {
-            context["tools"].push_back(Json::parse(options.tool_jsons[i]));
+            Json tool = Json::parse(options.tool_jsons[i]);
+            // `strict` selects the output contract's grammar; the model reads a definition as its
+            // template was trained on it, without that server flag.
+            if (tool.is_object()) {
+                const auto function = tool.find("function");
+                if (function != tool.end() && function->is_object()) { function->erase("strict"); }
+            }
+            context["tools"].push_back(std::move(tool));
             tool_tags.push_back(tag("/tools/" + std::to_string(i)));
         }
     }
@@ -573,6 +591,14 @@ RenderedChat CompiledChatTemplate::render_as(const std::vector<ChatMessage>& mes
             }
             break;
         }
+    }
+    if (options.tool_call_syntax == ToolCallSyntax::Flint && !continuation &&
+        options.add_generation_prompt && context.value("enable_thinking", true) == false) {
+        // Flint's template has no thinking switch, and the model opens <think> itself when it
+        // reasons. Disabled thinking closes an empty reasoning block, GLM's switch for the same
+        // role-marker format: after it Flint answers at once.
+        output.text.append(kFlintThinkOpen);
+        output.text.append(kFlintThinkClose);
     }
     if (!options.forced_tool_name.empty()) {
         // The syntax's call opens with the function name; everything the model produces after

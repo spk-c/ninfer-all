@@ -60,6 +60,7 @@ PrefillProgress ProgramImpl::wrap_prefill(std::uint32_t lane, runtime::PrefillSt
             .row_stride = 1,
         };
         out.pending.emplace(wrap_pending(lanes, round));
+        out.branches.assign(step.round.branches.begin(), step.round.branches.end());
     } else if (requests[lane].prefill && requests[lane].prefill->pending_capture_offer != 0) {
         out.capture.emplace(
             ContractAccess::make_capture_offer(this, runtime::LaneId{lane}, lane_epochs[lane],
@@ -449,6 +450,7 @@ runtime::ExecutionTiming ProgramImpl::append_forced_tokens(
             sequence.execution_frontier = end;
             sequence.ledger_frontier    = end + 1U;
             sequence.mtp_draft_count    = 0;
+            sequence.mtp_drafts_pending = false;
             sequence.tail_hidden_valid  = true;
             if (sequence.ledger.size() != sequence.ledger_frontier ||
                 sequence.prefix_identity.size() != sequence.ledger_frontier ||
@@ -922,6 +924,7 @@ bool ProgramImpl::retain_prefill_progress(SequenceState& state, RequestControl& 
     state.ledger_frontier    = retained.main_frontier;
     state.text_kv_valid      = retained.main_frontier;
     state.mtp_draft_count    = 0;
+    state.mtp_drafts_pending = false;
     if (speculative_backend == SpeculativeBackend::Mtp) {
         state.mtp_kv_valid = retained.backend_frontier;
     } else if (is_masked_draft_backend(speculative_backend)) {

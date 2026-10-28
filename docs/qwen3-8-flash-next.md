@@ -184,6 +184,10 @@ table artifact whose digest or row format differs from the one the model names.
 ./build/apps/ninfer-serve models/flash-next-q2_0.ninfer --ngram-table models/flash-next-ngram-table.ninfer \
   --devices 0,1 --max-context 32768
 
+# The same GPUs dividing every layer instead: GDN key heads, attention KV heads, routed experts (Linux).
+./build/apps/ninfer-serve models/flash-next-q2_0.ninfer --ngram-table models/flash-next-ngram-table.ninfer \
+  --devices 0,1 --tensor-parallel --max-context 32768
+
 # One GPU: the experts in pinned host memory, the most used of them cached on the GPU.
 ./build/apps/ninfer-serve models/flash-next-q2_0.ninfer --ngram-table models/flash-next-ngram-table.ninfer \
   --expert-residency host --max-context 32768
@@ -218,7 +222,9 @@ the same options, and the Docker image's `serve` command takes them with the fil
 | `--ngram-lock` | `ram`, `ram-hot`: lock the resident rows in physical memory (`mlock`, `VirtualLock`; needs the memlock limit or the privilege) |
 | `--no-ngram-table` | run without the n-gram table: see [below](#without-the-n-gram-table) |
 | `--kv-resident N\|all\|auto` | positions of each sparse-attention layer's KV a sequence keeps in device memory; a longer `--max-context` streams those layers ([streamed KV](#streamed-sparse-attention-kv)). `auto` (default): 32,768 with host or disk experts, all with device experts |
+| `--rope-yarn`, `--rope-yarn-factor F` | YaRN past the native 262,144 positions, as for the Qwen3.5 family: at `--max-context` / 262,144 once the window passes it, or at a fixed factor `F` (`1..4`) for every position. It reaches every rotation the model makes, the sparse-attention layers', their indexer's and the MTP block's, and changes every answer, short ones too. Without it positions past 262,144 rotate unscaled. `--rope-scaling-factor` is not available for this model. The startup log names the factor, and the request log's `server_start` record reports the resolved rotation (`engine.rope`) |
 | `--devices A,B,...` | one pipeline stage per GPU; layers are split so that every stage holds about the same stored bytes (`--stage-layers` overrides) |
+| `--tensor-parallel`, `--tensor-split A,B,...` | with `--devices`: every layer divided over the GPUs, its GDN key heads, its sparse-attention KV heads and its routed experts (GGUF banks on the devices), each GPU keeping the hyper-connection stack; the shared expert, the head, MTP and Vision on the first ([tensor parallelism](maintainer/pipeline-stages.md#tensor-parallelism-of-qwen38-flash-next)) |
 
 With device experts every expert runs on the GPU. With GGUF host and disk experts, by default the
 CPU computes a share of each decode or verification call's missing experts ([the CPU
@@ -254,7 +260,13 @@ uncached experts into (`--expert-prefill-buffers`) are cache slots between promp
 gets the same share of them, free until misses and rounds fill them. A prompt pass takes them
 back: the most routed of the experts they hold move into the slots of colder ones in the cache's
 own memory, the rest leave, and the copies into the buffers wait for the moves. The next decode
-or verification pass returns them zeroed.
+or verification pass returns them zeroed and refills them at once with the most routed experts the
+cache lacks (those the tier counts at least twice), copied on the side stream as a round's are and
+serving once a layer's copies have landed, so the decode after a prompt does not wait for many
+rounds to fill them again; buffers' slots left over stay free. On an RTX 4090 with the IQ3_S
+release's host experts the 256 tokens after a 31,865-token document decoded 1.052 times as fast as
+without the refill (geomean over the nine `--kv-dtype` formats, 0.992-1.118); after short prompts
+the ratio stayed within the run-to-run spread (code 0.993, prose 1.011).
 
 With host experts the GPU holds only the dense weights (3.7 GB for the Q2_0 release), the
 per-request state and the expert cache; the host needs the expert banks in page-locked memory
@@ -293,16 +305,18 @@ images do not depend on the share, on `auto`'s choices or on the thread count. T
 quantized as the GPU quantizes them (q8_1: per 32 values `d = amax / 127`, codes `round(v / d)`,
 `d` rounded to binary16). A 32-value slice gives the exact integer dot of its codes and the
 activation's, and its product is `(factor * d) * dot`, each step rounded, with the slice's exact
-factor (the block's binary16 multiplier times its integer scale); IQ2_S's is
-`d * fma(factor0, dot0, factor1 * dot1)` over its two halves, Q6_K's
-`d * (factor0 * dot0 + factor1 * dot1)`, and Q4_K's and Q5_K's `(factor * d) * dot` less the
-block's minimum times the slice's activation sum (q8_1's `s`). Slice `s` joins lane `s mod 32` in
+factor (the block's binary16 multiplier times its integer scale); IQ2_S's and IQ1_M's are
+`d * fma(factor0, dot0, factor1 * dot1)` over their two halves (IQ1_M's codes are eight times its
+values, `8c - 7` or `8c - 9`, and its factors `d (2s + 1) / 8` carry the eighth), Q6_K's
+`d * (factor0 * dot0 + factor1 * dot1)`, Q4_K's and Q5_K's `(factor * d) * dot` less the
+block's minimum times the slice's activation sum (q8_1's `s`), and IQ1_S's
+`factor * fma(d, dot, (delta - 1) * s)` over its codes 0 to 2. Slice `s` joins lane `s mod 32` in
 slice order, and the 32 lanes meet as in a warp's butterfly (16, 8, 4, 2, 1 apart). SiLU (and
 Gemma 4's GELU) is `ops/common/silu.h` on both sides, built from correctly rounded operations only,
 and the middle is rounded to BF16 before it is quantized for the down product. No compiler fuses
 these steps on either side: the GPU kernels spell them with `_rn` intrinsics and the CPU sources
-build without floating-point contraction. Q2_0, Q4_0, Q5_0, Q8_0, Q4_K, Q5_K, Q6_K, IQ4_NL, IQ2_S,
-IQ3_XXS, IQ3_S and IQ4_XS have CPU products, in AVX2 (with FMA and F16C) where the CPU has it and
+build without floating-point contraction. Q2_0, Q4_0, Q5_0, Q8_0, Q4_K, Q5_K, Q6_K, IQ4_NL, IQ1_S,
+IQ1_M, IQ2_XXS, IQ2_S, IQ3_XXS, IQ3_S and IQ4_XS have CPU products, in AVX2 (with FMA and F16C) where the CPU has it and
 in portable C++ elsewhere, with the same bits.
 
 ### The n-gram rows
@@ -439,17 +453,17 @@ measured on this model yet.
 its own KV and recurrent state, so every sequence costs device memory (the KV of `--max-context`
 positions, 24 KiB a position in BF16 and less in a quantized `--kv-dtype`, plus 74 MiB of recurrent
 state). Requests are admitted
-in arrival order. Prompts prefill a step at a time, each step from the prompt with the fewest
-tokens left, so a short or cached request is not held behind a long prompt for its whole prefill
-(a prompt passed over eight times goes next, and a prompt with media, once begun, finishes
-first). A step is one chunk, or with host experts on one GPU a span of up to eight chunks of a text
-prompt (see [Execution](#execution)); while other requests decode, a span is two chunks at most,
+in arrival order. Prompts prefill a step at a time, each step from the prompt with the fewest tokens
+left, so a short or cached request is not held behind a long prompt for its whole prefill (a prompt
+passed over eight times goes next, and a prompt with media, once begun, finishes first). A step is
+one chunk, or with host or disk experts on one GPU a span of up to eight chunks of the prompt, media
+or not (see [Execution](#execution)); while other requests decode, a span is two chunks at most,
 since they wait for the whole step. Before a step, while requests are decoding, they run
 `--decode-rounds-per-prefill` rounds (by default the chunk size over 64, 16 at the default chunk)
 for each chunk's worth of prompt the step computes, at least one, so a short prompt gets in after
-one round and the streams keep their share during a long one; each round is one batched pass
-whose experts read their weights once for the whole batch, so the batch costs little more than one
-token while the experts dominate the step.
+one round and the streams keep their share during a long one; each round is one batched pass whose
+experts read their weights once for the whole batch, so the batch costs little more than one token
+while the experts dominate the step.
 
 With the context cache on (the default), a sequence keeps its state when its request ends, and a
 snapshot of its recurrent state where the prompt's last user turn closes (or at the prompt's end
@@ -462,7 +476,12 @@ reused. A request goes to the free sequence that holds the longest such prefix o
 `--no-prefix-reuse` (ninfer-serve) prefills every prompt from scratch.
 
 What a sequence gives up for a new request (its turn-closure snapshot and the state it ended in,
-each of 128 tokens or more) is kept as an image in host memory: the paged KV and pooled keys
+each of 128 tokens or more, the end of a disposable request such as a decision read excepted) is
+kept as an image in host memory, and so is the state where the frontend marks a prefix other
+requests share (the end of the leading system messages, of the tool declarations, a declared
+cache boundary, 128 tokens or more): a prompt step ends there, and requests with the same prefix
+resume after it on any sequence, also when they arrive together, since a prompt that has not
+started prefilling looks for images again at its first step. An image is the paged KV and pooled keys
 of its positions, its recurrent state, and the MTP block's, about 114 MB plus 26 KiB a position in
 BF16 KV. The images live in 8 MiB pages of pinned memory that stay pinned for later images: the
 pages of two images of a whole context (within a quarter of the budget) are pinned at startup, and
@@ -477,6 +496,8 @@ default; past it the least recently used images go to the disk tier with `--disk
 (`--disk-kv-gib`, 64 by default), one file each under a directory per artifact, KV format, MTP
 draft width and n-gram enablement, or are dropped without one. A different verify width or disabling
 the n-gram table can change sequence state, so those runs cannot restore another profile's images.
+A request that does not draft (a decision read) runs its prompt without the MTP block, so its
+sequence's snapshots and images carry no MTP state and serve only requests that do not draft.
 With `--disk-kv-restore` a
 prompt also resumes from an image on
 disk, which a later run finds there too.
@@ -502,9 +523,9 @@ MTP is enabled. A fresh text-only request can use MTP again after the media requ
 
 `--spec mtp --draft-tokens N` (1 to 15) decodes with the MTP block of an artifact converted with it
 ([Convert](#convert)); without the block the engine refuses to start. Without `--spec`, an artifact
-with the block and host or disk experts drafts three tokens a round (a verification window's routes
-share the layer's missing experts, which the CPU computes while the cached ones run); `--spec none`
-decodes without drafts. Text-only decoding requests then
+with the block and host or disk experts drafts up to three tokens a round with `--draft-min-p 0.5`
+(a verification window's routes share the layer's missing experts, which the CPU computes while the
+cached ones run); `--spec none` decodes without drafts. Text-only decoding requests then
 runs rounds: the MTP block (one more sparse-attention layer with its own 512-expert MoE, its own
 final mixer and the model's head) drafts N tokens from the stack the model left at the request's
 last position (the head's argmax at each step), the model verifies the last sampled token and the N
@@ -520,15 +541,21 @@ decode byte for byte. The kernels are qualified against independent mathematical
 repetition holds the execution configuration fixed. Acceptance is bounded by the remaining output
 and thinking-token budgets, including the correction or bonus token.
 
-`--draft-min-p P` optionally shortens the verification after the first draft whose absolute
-probability over the public vocabulary is at or below P. It includes that draft, so every round
-verifies at least one; P=0 disables the calculation and P=1 verifies one. A batch verifies its
-largest selected prefix, with acceptance bounded separately for each request. This is distinct
-from the sampling `--min-p` filter. The full captured draft chain still runs, and `drafted_tokens`
-counts that work. Only verification shrinks; a throughput gain is not established. The floor is
-part of the disk context-cache profile, and each verification width has its own CUDA Graph.
-On the published Q2 artifact a floor of 0.3 produced the same tokens and acceptance as zero, which
-stays the default.
+`--draft-min-p P` optionally ends a round's drafting at the first draft whose absolute
+probability over the public vocabulary is at or below P. The round verifies the drafts up to and
+including that one, so every round verifies at least one; P=0 disables the calculation and P=1
+drafts and verifies one. A batch drafts until each of its requests has reached such a draft (or the
+last step) and verifies each request's own selected prefix, the rows packed at their own widths
+(all at the largest one when a request gathers logprobs). This is distinct from the sampling
+`--min-p` filter. With a floor each draft step runs from its own CUDA Graph and the host reads the
+step's probabilities before it starts the next, so `drafted_tokens` counts the steps that ran;
+each verification width has its own CUDA Graph. The floor is part of the disk context-cache
+profile. `--spec mtp` keeps the full window unless
+`--draft-min-p` is set; the automatic drafting uses 0.5. On an RTX 4090 with the IQ3_S release's
+host experts (EPYC 7V13, 32-CPU quota, 64K context; 256 greedy tokens after a code prompt, a prose
+prompt and a 31,865-token document, once per `--kv-dtype` format) three drafts with the floor 0.5
+decoded 1.040 times as fast as without it (geomean of 27 pairs, 0.953-1.131, slower in 5): a round
+drafted 2.48 tokens instead of 3 and committed 2.27 instead of 2.31.
 
 The verification leaves the sequence's state where it was: each Gated DeltaNet layer records its
 transitions and the commit replays the kept ones into the state (the Qwen3.5 family's ReplaySSM
@@ -614,7 +641,17 @@ draft-chain graph and each width its own verification graph, captured at their s
   every layer with mapped misses, and after a prompt chunk with staged ones. With disk experts the
   cache works per layer instead: once a layer has routed its tokens, the experts it lacks are read
   into the slots least recently used (never one the same call needs), and only then do the
-  layer's experts run.
+  layer's experts run. A prompt longer than a chunk runs in the same spans as with host experts,
+  each chunk's experts on their own: the chunks of a span reach a layer one after another, so the
+  experts the first chunks read are still in their slots for the later ones, and an expert is read
+  once per span rather than once per chunk. At a span's last chunk the layer's residents that chunk
+  does not route to are released: once no slot is empty, later reads take released slots first,
+  oldest release first, before the least recently used, unless a call routes to them again. The
+  span's later layers thus read their experts into the earlier layers' stale ones, and every layer
+  keeps the experts of the prompt's end. Empty slots are always taken first. The MTP block's experts
+  (stored as Q8_0, wider than the text layers') have slots of their own, sized for one chunk's
+  routes, when the rest of the budget still holds a text layer's widest call; the text layers'
+  slots are then sized for their own experts (11,815 Q2_0 slots instead of 3,504 on an RTX 3090).
 - A decode step (one token) replays a CUDA graph per pipeline stage, captured at a sequence's
   second decode step; the token's position reaches the sparse-attention kernels in device memory.
   Disk experts need the host between a layer's routing and its experts, so their steps stay eager.
@@ -622,9 +659,15 @@ draft-chain graph and each width its own verification graph, captured at their s
 - With MTP, a verification of one request (at most eight tokens, so its experts take the vector
   products) replays graphs of its own the same way, and so does the draft chain of one request on
   one GPU, host experts included; several requests' rounds, the MTP catch-up and disk experts run
-  eagerly. With staged host misses the MTP block runs only its cached experts, their weights
-  renormalized per token: it only steers drafts, which verification checks, so the output is
-  unchanged while drafting never waits for the bus.
+  eagerly. With staged host misses the MTP block serves its missing experts in draft steps and a
+  round's cells (at most eight tokens) as a decode layer does, copied or computed by the CPU, so
+  the drafts follow the block's own routing; over longer prompt chunks it runs only its cached
+  experts, their weights renormalized per token, since it only steers drafts, which verification
+  checks. On an RTX 4090 with the IQ3_S release's host experts (EPYC 7742, 64K context, three
+  drafts with `--draft-min-p 0.5`, 256 greedy tokens after a code prompt, a prose
+  prompt and a 31,865-token document, once per `--kv-dtype` format) serving those misses instead
+  of dropping them committed 5-21% more tokens a round and decoded 1.025 times as fast (geomean of
+  27 pairs, 0.959-1.092; slower in 4, the two largest losses after the document).
 - A pass whose layers may wait on the device for their missing experts ends synchronized: CUDA
   loads a kernel lazily at its first launch, a load may wait for the device to go idle, and a
   launch during such a wait would deadlock with the service it waits for.
@@ -633,63 +676,89 @@ draft-chain graph and each width its own verification graph, captured at their s
 
 ### Expert placements
 
-Greedy decoding, one request. Decode is measured over a short answer (78 tokens for Q2_0) and over
-the first tokens after a 4,463-token prompt; prefill is that prompt. Host memory is the process's
-peak resident set (the pinned bank for host experts); device memory the most `nvidia-smi` showed in
-use.
+Greedy decoding, one request, the generate test (`ninfer_qwen4_exp_generate_real`) without drafts.
+Decode is measured over a short answer (78 tokens for Q2_0, 81 or 82 for IQ3_S) and over the first
+five tokens after a 4,463-token prompt; prefill is that prompt in 512-token chunks, which with host
+or disk experts run as a span of eight chunks and a last chunk of 367 tokens. Host memory is
+the process's peak resident set (with host experts, the pinned bank), device memory the most
+`nvidia-smi` showed in use. With host or disk experts the expert cache takes the memory the GPU has
+free and fills while the requests run.
 
-The Q2_0 release on the RTX 30 series, October 5, CUDA 12.8, the table inside the artifact, 512-token
-prefill chunks:
+One GPU, October 26, 2026, a build of `master` with CUDA 13.4 (`120a` on the RTX 5090, `sm_86` on
+the others), the n-gram table as the separate artifact, one run per row:
 
-| Hardware and placement | Device memory | Host memory | Decode, short answer | Decode after 4,463 tokens | Prefill |
-|---|---:|---:|---:|---:|---:|
-| 2× RTX 3090 Ti (PCIe, no P2P), experts on the GPUs (`--devices 0,1`) | 18.4 + 19.4 GB | 0.7 GB | 90.2 tok/s | 107 tok/s | 1,504 tok/s |
-| RTX 3090, experts in pinned host memory, 17.7 GB expert cache | 22.6 GB | 34 GB pinned | 48.9 tok/s | 42.1 tok/s | 842 tok/s |
-| RTX 3090, experts on disk, artifact in the page cache | 22.6 GB | 0.9 GB + page cache | 47.0 tok/s | 39.1 tok/s | 630 tok/s |
-| RTX 3090, experts on disk, page cache dropped every second (NVMe) | 22.6 GB | 0.9 GB | 17.2 tok/s | 11.3 tok/s | 195 tok/s |
+- RTX 5090: 575 W, PCIe 5.0 x16, a 16-core Ryzen 9 7950X and 124 GB of RAM.
+- RTX 4090: 450 W, PCIe 4.0 x16, a 48-core EPYC 7K62 and 503 GB of RAM.
+- RTX 3090: 370 W, PCIe 3.0 x16, two 26-core Xeon Platinum 8272CL sockets (four NUMA nodes) and
+  1.5 TB of RAM. The test ran pinned to the CPUs of the GPU's NUMA node after the model files'
+  pages were evicted, so the pinned bank and the page cache are on that node.
 
-The IQ3_S release on one RTX 3090 (310 W, PCIe 4.0 x16) in a host with 62 GB of RAM, 23 cores of an
-AMD EPYC 7663 and an NVMe drive, October 5, with the Q2_0 release in the same sitting; decode counts
-the 86 tokens of the short answer:
+| Card | Release | Experts | Device memory | Host memory | Decode, short answer | Decode after 4,463 tokens | Prefill |
+|---|---|---|---:|---:|---:|---:|---:|
+| RTX 5090 | Q2_0 | pinned host memory | 30.1 GiB | 33.3 GiB | 97.8 tok/s | 83.2 tok/s | 3,290 tok/s |
+| RTX 5090 | Q2_0 | disk, the files in the page cache | 30.1 GiB | 1.7 GiB + page cache | 72.1 tok/s | 102.9 tok/s | 1,827 tok/s |
+| RTX 5090 | Q2_0 | disk, the files' pages evicted every second | 30.1 GiB | 1.7 GiB | 37.7 tok/s | 66.4 tok/s | 1,108 tok/s |
+| RTX 5090 | IQ3_S | pinned host memory | 30.1 GiB | 48.7 GiB | 82.5 tok/s | 70.7 tok/s | 2,451 tok/s |
+| RTX 5090 | IQ3_S | disk, the files in the page cache | 30.1 GiB | 2.0 GiB + page cache | 56.4 tok/s | 35.5 tok/s | 770 tok/s |
+| RTX 5090 | IQ3_S | disk, the files' pages evicted every second | 30.1 GiB | 2.0 GiB | 28.5 tok/s | 16.7 tok/s | 399 tok/s |
+| RTX 4090 | Q2_0 | pinned host memory | 22.1 GiB | 33.1 GiB | 73.9 tok/s | 66.9 tok/s | 1,801 tok/s |
+| RTX 4090 | Q2_0 | disk, the files in the page cache | 22.1 GiB | 1.5 GiB + page cache | 46.5 tok/s | 42.5 tok/s | 1,144 tok/s |
+| RTX 4090 | Q2_0 | disk, the files' pages evicted every second | 22.1 GiB | 1.5 GiB | 21.0 tok/s | 14.6 tok/s | 558 tok/s |
+| RTX 3090 | Q2_0 | pinned host memory | 22.2 GiB | 33.1 GiB | 39.1 tok/s | 45.7 tok/s | 663 tok/s |
+| RTX 3090 | Q2_0 | disk, the files in the page cache | 22.1 GiB | 1.5 GiB + page cache | 27.8 tok/s | 27.5 tok/s | 503 tok/s |
+| RTX 3090 | Q2_0 | disk, the files' pages evicted every second | 22.1 GiB | 1.5 GiB | 19.7 tok/s | 14.4 tok/s | 474 tok/s |
+| RTX 3090 | IQ3_S | pinned host memory | 22.2 GiB | 48.5 GiB | 27.1 tok/s | 33.1 tok/s | 438 tok/s |
+| RTX 3090 | IQ3_S | disk, the files in the page cache | 22.1 GiB | 1.7 GiB + page cache | 17.4 tok/s | 13.7 tok/s | 256 tok/s |
+| RTX 3090 | IQ3_S | disk, the files' pages evicted every second | 22.1 GiB | 1.7 GiB | 12.3 tok/s | 6.0 tok/s | 179 tok/s |
 
-| Release and placement | Device memory | Host memory | Decode, short answer | Decode after 4,463 tokens | Prefill |
-|---|---:|---:|---:|---:|---:|
-| IQ3_S, experts in pinned host memory, 16.2 GB expert cache | 22.1 GiB | 50.3 GB pinned | 34.4 tok/s | 30.2 tok/s | 533 tok/s |
-| IQ3_S, experts on disk, the page cache holding what of the 83.6 GB file fits | 22.1 GiB | page cache | 19.0 tok/s | 21.6 tok/s | 209 tok/s |
-| IQ3_S, experts on disk, the file's pages evicted every second | 22.1 GiB | — | 10.7 tok/s | 5.4 tok/s | 47 tok/s |
-| Q2_0, experts in pinned host memory | 22.1 GiB | 34.0 GB pinned | 50.2 tok/s | 43.7 tok/s | 847 tok/s |
+- **Prompt spans.** With host or disk experts a prompt longer than a chunk prefills in spans of up
+  to eight chunks, so a layer's missing experts cross the host link once per span rather than once
+  per chunk; the chunk still sets each call's width. The CLI with its defaults (1,024-token chunks,
+  MTP drafts) on the 7,680-token needle prompt with Q2_0 disk experts, 16 greedy tokens, this build
+  against one that ran disk experts chunk by chunk with the MTP block's experts in the text layers'
+  slots, interleaved on the same hosts, two runs each:
 
-The Q2_0 release (with the separate table artifact) on RTX 4090s at 450 W (PCIe 4.0 x16, no peer
-access) in a cloud VM with two EPYC 7543 sockets of 60 vCPUs each, both GPUs on NUMA node 0, 694 GB
-of RAM and its container disk, October 6. The single-GPU rows ran pinned to node 0's CPUs
-(`taskset -c 0-59`); the ranges are two runs:
+  | Card | Model files | Prefill, tok/s | Decode after it, tok/s |
+  |---|---|---:|---:|
+  | RTX 5090 | in the page cache | 1,830 against 449-450 | 114.7-114.8 against 31.4-31.9 |
+  | RTX 5090 | pages evicted every second | 970-1,000 against 194-196 | 55.7-58.6 against 15.4 |
+  | RTX 4090 | in the page cache | 1,640-1,670 against 494 | 44.8-44.9 against 23.7-24.0 |
+  | RTX 4090 | pages evicted every second | 532-549 against 131-133 | 12.4-12.7 against 13.6-13.9 |
+  | RTX 3090 | in the page cache | 927-988 against 305-307 | 30.2-31.0 against 17.4 |
+  | RTX 3090 | pages evicted every second | 469-471 against 103-104 | 12.3-12.4 against 6.4-6.5 |
 
-| Hardware and placement | Device memory | Host memory | Decode, short answer | Decode after 4,463 tokens | Prefill |
-|---|---:|---:|---:|---:|---:|
-| 2× RTX 4090, experts on the GPUs (`--devices 0,1`) | 18.5 + 19.4 GiB | 0.8 GiB | 92.6-100.7 tok/s | 116-120 tok/s | 3,482-3,734 tok/s |
-| RTX 4090, experts in pinned host memory, 15.9 GB expert cache | 20.7 GiB | 34.0 GB pinned | 52.6-52.7 tok/s | 44.3-44.6 tok/s | 1,137-1,139 tok/s |
-| RTX 4090, experts on disk, artifact in the page cache | 20.7 GiB | 1.0 GiB + page cache | 42.0 tok/s | 45.6 tok/s | 723 tok/s |
-| RTX 4090, experts on disk, the artifact's and table's pages evicted every second | 20.5 GiB | 1.0 GiB | 17.7 tok/s | 12.2 tok/s | 160 tok/s |
+- **Decode after the prompt.** Against the same test chunk by chunk (and without the releases), on
+  the same hosts, the Q2_0 rows prefill 3.9-4.3 times as fast with host experts, 1.0-1.4 times
+  from the page cache and 1.0-2.0 times with the pages evicted. The five tokens after the prompt
+  decode 10-12% slower from disk (2% faster on the RTX 3090 with the pages evicted): the span's last
+  chunk keeps its experts, but this prompt ends in a separate 367-token chunk; without the releases
+  the RTX 5090 decoded them at the rate chunk by chunk. With host experts they decode 1% slower on
+  the RTX 5090, 8% slower on the RTX 4090 and 2% faster on the RTX 3090.
+- **NUMA.** Unpinned on another two-socket RTX 3090 host (Xeon E5-2690 v4), Q2_0 decoded the short
+  answer 9% slower with host experts and 43% slower with disk experts in the page cache than pinned
+  to the GPU's node.
+- **The host.** Host and disk experts cross the host link, and disk experts are read by the CPU
+  threads, so these rows measure the host as much as the card.
 
-Left unpinned on that VM, the host-expert row decodes at 39.5-40.1 tok/s and prefills at 775-827
-tok/s, the page-cache row at 31.9-33.0 tok/s and 571-674 tok/s, and the evicted row at 15.7 tok/s
-and 144 tok/s: the copies out of host memory then cross the socket link. CUDA graphs add 1% and 10%
-to the short-answer decode on the two GPUs in the two runs (91.5-91.7 tok/s eager) and 5 to 6% with
-pinned host experts (49.9-50.1 tok/s eager). Host memory is the process's peak resident set, device
-memory the most `nvidia-smi` showed in use.
-
-Both releases on Blackwell, 2026-10-06, a `120a` build with CUDA 13.1, the table as the separate
-artifact, the single-GPU rows pinned to the CPUs of the GPU's NUMA node, two runs where a range is
-given:
+Every expert on the GPUs, and the RTX PRO 6000, October 5 and 6, 2026, earlier builds: CUDA 12.8
+and the table inside the artifact on the two RTX 3090 Ti; CUDA 12.8 and the separate table on two
+RTX 4090s at 450 W (PCIe 4.0 x16, no peer access) in a cloud VM with two EPYC 7543 sockets, both
+GPUs on NUMA node 0, and 694 GB of RAM; on Blackwell a `120a` build with CUDA 13.1 and the separate
+table, single-GPU rows pinned to the CPUs of the GPU's NUMA node:
 
 - RTX PRO 6000 Blackwell Workstation Edition: 600 W, a PCIe 4.0 x16 host link, 64 vCPUs and
-  1.1 TB of RAM.
-- RTX 5090s: boards with a 600 W default limit, PCIe 5.0 x16, 512 threads and 1 TB of RAM.
+  1.1 TB of RAM; short answer 87 tokens for IQ3_S.
+- RTX 5090s: boards with a 600 W default limit, PCIe 5.0 x16, 512 threads and 1 TB of RAM; short
+  answer 81 tokens for IQ3_S.
 
-The short answer is 78 tokens for Q2_0, and 87 (PRO 6000) or 81 (RTX 5090) for IQ3_S.
+The ranges are two runs.
 
 | Hardware and placement | Release | Device memory | Host memory | Decode, short answer | Decode after 4,463 tokens | Prefill |
 |---|---|---:|---:|---:|---:|---:|
+| 2× RTX 3090 Ti (PCIe, no P2P), experts on the GPUs (`--devices 0,1`) | Q2_0 | 18.4 + 19.4 GB | 0.7 GB | 90.2 tok/s | 107 tok/s | 1,504 tok/s |
+| 2× RTX 4090, experts on the GPUs (`--devices 0,1`) | Q2_0 | 18.5 + 19.4 GiB | 0.8 GiB | 92.6-100.7 tok/s | 116-120 tok/s | 3,482-3,734 tok/s |
+| 2× RTX 5090, experts on the GPUs (`--devices 0,1`) | Q2_0 | 18.8 + 19.6 GiB | 0.9 GiB | 136.1-136.3 tok/s | 157.0-157.2 tok/s | 3,807-3,811 tok/s |
+| 2× RTX 5090, experts on the GPUs (`--devices 0,1`) | IQ3_S | 26.5 + 27.8 GiB | 1.0 GiB | 121.6-121.9 tok/s | 141.8-142.0 tok/s | 3,310-3,341 tok/s |
 | RTX PRO 6000, experts on the GPU | Q2_0 | 37.7 GiB | 0.8 GiB | 136.0-139.7 tok/s | 160.7-162.6 tok/s | 2,925-2,952 tok/s |
 | RTX PRO 6000, experts on the GPU | IQ3_S | 53.7 GiB | 1.0 GiB | 123.8-125.9 tok/s | 146.8-146.9 tok/s | 2,540-2,541 tok/s |
 | RTX PRO 6000, experts in pinned host memory | Q2_0 | 38.5 GiB | 34.0 GB pinned | 54.8-55.0 tok/s | 67.7-70.0 tok/s | 1,296-1,297 tok/s |
@@ -698,26 +767,12 @@ The short answer is 78 tokens for Q2_0, and 87 (PRO 6000) or 81 (RTX 5090) for I
 | RTX PRO 6000, experts on disk, the files in the page cache | IQ3_S | 93.5 GiB | 1.2 GiB + page cache | 65.6 tok/s | 106.0 tok/s | 1,661 tok/s |
 | RTX PRO 6000, experts on disk, the files' pages evicted every second | Q2_0 | 93.5 GiB | 1.0 GiB | 35.1 tok/s | 87.1 tok/s | 1,000 tok/s |
 | RTX PRO 6000, experts on disk, the files' pages evicted every second | IQ3_S | 93.5 GiB | 1.2 GiB | 28.7 tok/s | 78.6 tok/s | 773 tok/s |
-| 2× RTX 5090, experts on the GPUs (`--devices 0,1`) | Q2_0 | 18.8 + 19.6 GiB | 0.9 GiB | 136.1-136.3 tok/s | 157.0-157.2 tok/s | 3,807-3,811 tok/s |
-| 2× RTX 5090, experts on the GPUs (`--devices 0,1`) | IQ3_S | 26.5 + 27.8 GiB | 1.0 GiB | 121.6-121.9 tok/s | 141.8-142.0 tok/s | 3,310-3,341 tok/s |
-| RTX 5090, experts in pinned host memory | Q2_0 | 30.0 GiB | 34.0 GB pinned | 74.1-74.2 tok/s | 93.9-94.2 tok/s | 1,676-1,678 tok/s |
-| RTX 5090, experts in pinned host memory | IQ3_S | 30.0 GiB | 50.3 GB pinned | 40.7 tok/s | 41.0 tok/s | 1,100 tok/s |
-| RTX 5090, experts on disk, the files in the page cache | Q2_0 | 29.9 GiB | 1.0 GiB + page cache | 67.5 tok/s | 76.7 tok/s | 1,739 tok/s |
-| RTX 5090, experts on disk, the files in the page cache | IQ3_S | 29.9 GiB | 1.1 GiB + page cache | 55.3 tok/s | 44.3 tok/s | 439 tok/s |
-| RTX 5090, experts on disk, the files' pages evicted every second | Q2_0 | 29.9 GiB | 1.0 GiB | 25.3 tok/s | 28.7 tok/s | 694 tok/s |
-| RTX 5090, experts on disk, the files' pages evicted every second | IQ3_S | 29.9 GiB | 1.1 GiB | 18.8 tok/s | 14.9 tok/s | 171 tok/s |
 
-- **Device expert cache.** With host or disk experts the cache takes the memory the GPU has free
-  and fills while the requests run: 94 GB of it on the PRO 6000, where nearly every expert ends up
-  resident, and 30 GB on the RTX 5090.
-- **Host link.** Host and disk experts cross the host link: PCIe 5.0 x16 on the RTX 5090 host,
-  PCIe 4.0 x16 on the PRO 6000 host, the likeliest reason the RTX 5090's host-expert row beats the
-  PRO 6000's.
+- **Device expert cache.** On the PRO 6000 the cache takes 94 GB, and nearly every expert ends up
+  resident.
 - **CUDA graphs** add 27% to the short-answer decode on the two RTX 5090s (107.0 tok/s eager), 23
-  to 26% on the PRO 6000 and 11% on the two RTX 3090 Ti; disk experts decode eagerly.
-- **Prefill chunk.** Prefill touches nearly every expert of every layer in each chunk, so with host
-  or disk experts a larger `--prefill-chunk` serves more tokens per copy: on an RTX 3090 Ti the long
-  prompt took 6.05 s in 512-token chunks and 4.58 s in 2,048.
+  to 26% on the PRO 6000, 11% on the two RTX 3090 Ti, and 1% and 10% on the two RTX 4090s in their
+  two runs (91.5-91.7 tok/s eager); disk experts decode eagerly.
 
 Every GSQ-RCO release (Q2_0, IQ2_XS, IQ3_XXS, IQ3_S and the Coder IQ1_M) answers the generate
 test's prompts with disk and host experts, with and without CUDA graphs; with disk experts the

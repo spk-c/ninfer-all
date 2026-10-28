@@ -21,6 +21,25 @@ void apply_storage_trades(Bindings& bindings, const Config& config, const ModelW
     if (options.embedding_q4 && options.embedding_q6) {
         throw std::invalid_argument("--embedding-q4 and --embedding-q6 are mutually exclusive");
     }
+    if (options.embedding_residency == EmbeddingResidency::Host) {
+        // The transcodes only shrink a device copy, and a host table holds no device memory.
+        if (options.embedding_q4 || options.embedding_q6) {
+            throw std::invalid_argument(
+                "--embedding-residency host and --embedding-q4/--embedding-q6 cannot be combined");
+        }
+        // A tied table is also the output head, which a projection reads whole every step.
+        const auto& embedding = bindings.at(weights.text.token_embedding).reference.binding;
+        const auto& head      = bindings.at(weights.text.output_head).reference.binding;
+        for (const auto& a : embedding.parts) {
+            for (const auto& b : head.parts) {
+                if (a.object.index == b.object.index) {
+                    throw std::invalid_argument(
+                        "--embedding-residency host needs an untied token embedding; this "
+                        "artifact stores it in the same object as the output head");
+                }
+            }
+        }
+    }
     if (options.lm_head_q4 || options.lm_head_q6) {
         if (options.masked_draft()) {
             // DFlash's candidate top-k reads the Q8 output head through its own kernel.
@@ -127,7 +146,7 @@ void apply_device_layouts(Bindings& bindings, const ModelWeights& weights,
             continue;
         }
         for (const auto& part : parameter.reference.binding.parts) {
-            const auto& geometry = bindings.binder.reader().geometry(part.object);
+            const auto geometry = bindings.binder.geometry(part.object);
             const bool format =
                 geometry.format == QType::T2_G128_FP16 || geometry.format == QType::Q2_G64_FP16 ||
                 geometry.format == QType::Q4_G64_FP16 || geometry.format == QType::Q5_G64_FP16 ||

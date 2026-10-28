@@ -175,8 +175,11 @@ void launch_replay_fold_typed(const GdnReplayRecords& records,
         records.spec.record_capacity * records.spec.width,
         active_width,
         rows,
+        records.spec.qk_heads,
+        records.spec.value_heads,
+        records.spec.conv_channels,
     };
-    const dim3 grid(static_cast<unsigned>(Geometry::kValueHeads),
+    const dim3 grid(static_cast<unsigned>(records.spec.value_heads),
                     static_cast<unsigned>(active_rows),
                     static_cast<unsigned>(records.spec.layers * (kStateDim / kBlockDv)));
     const dim3 block(kWarpSize, kNumWarps, 1);
@@ -261,21 +264,23 @@ void launch_recurrent_record(const Tensor& q, const Tensor& k, const Tensor& v, 
 void launch_replay_fold(const GdnReplayRecords& records, LinearAttentionStateAllLayersView states,
                         const GdnReplayFoldKernelRows& rows, std::int32_t active_rows,
                         std::int32_t active_width, cudaStream_t stream) {
-    if (records.spec.qk_heads == FoldGeometry16x48::kQkHeads &&
-        records.spec.value_heads == FoldGeometry16x48::kValueHeads &&
-        records.spec.conv_channels == FoldGeometry16x48::kConvChannels) {
-        launch_replay_fold_fixed<FoldGeometry16x48>(records, states, rows, active_rows,
-                                                    active_width, stream);
-        return;
+    bool launched      = false;
+    const auto attempt = [&]<class Geometry>(Geometry) {
+        if (launched || records.spec.qk_heads != Geometry::kQkHeads ||
+            records.spec.value_heads != Geometry::kValueHeads ||
+            records.spec.conv_channels != Geometry::kConvChannels) {
+            return;
+        }
+        launch_replay_fold_fixed<Geometry>(records, states, rows, active_rows, active_width,
+                                           stream);
+        launched = true;
+    };
+    attempt(FoldGeometry16x48{});
+    attempt(FoldGeometry16x32{});
+    if (!launched) {
+        launch_replay_fold_fixed<FoldGeometryDynamic>(records, states, rows, active_rows,
+                                                      active_width, stream);
     }
-    if (records.spec.qk_heads == FoldGeometry16x32::kQkHeads &&
-        records.spec.value_heads == FoldGeometry16x32::kValueHeads &&
-        records.spec.conv_channels == FoldGeometry16x32::kConvChannels) {
-        launch_replay_fold_fixed<FoldGeometry16x32>(records, states, rows, active_rows,
-                                                    active_width, stream);
-        return;
-    }
-    throw std::invalid_argument("GDN replay fold launcher received an unregistered geometry");
 }
 
 } // namespace ninfer::ops::detail::gated_delta_net

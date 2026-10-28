@@ -248,6 +248,38 @@ runtime::RawTokenLogprob ProgramImpl::fetched_logprob(std::int32_t row, TokenId 
     return record;
 }
 
+std::int32_t ProgramImpl::arm_readout(std::span<const TokenId> ids) {
+    if (ids.empty()) { return 0; }
+    if (ids.size() > kMaximumReadoutTokens ||
+        static_cast<std::int64_t>(ids.size()) > io.readout_ids.ne[0]) {
+        throw std::logic_error("readout token ids exceed the round buffer");
+    }
+    // A pageable source: the copy completes on the host before it returns.
+    CUDA_CHECK(cudaMemcpyAsync(io.readout_ids.data, ids.data(), ids.size() * sizeof(TokenId),
+                               cudaMemcpyHostToDevice, device.stream));
+    return static_cast<std::int32_t>(ids.size());
+}
+
+void ProgramImpl::fetch_readout(std::int32_t count) {
+    if (count <= 0) { return; }
+    if (!readout_host) {
+        readout_host.emplace(kMaximumConcurrency * kMaximumReadoutTokens * sizeof(float));
+    }
+    CUDA_CHECK(cudaMemcpyAsync(readout_host->data(), io.readout_values.data,
+                               static_cast<std::size_t>(count) * sizeof(float),
+                               cudaMemcpyDeviceToHost, device.stream));
+}
+
+void ProgramImpl::attach_readout(runtime::RawTokenLogprob& record, std::int32_t count,
+                                 std::int32_t row) const {
+    record.readout_count = 0;
+    if (count <= 0) { return; }
+    const auto* values = static_cast<const float*>(readout_host->data()) +
+                         static_cast<std::size_t>(row) * kMaximumReadoutTokens;
+    std::copy_n(values, count, record.readout_values.begin());
+    record.readout_count = static_cast<std::uint32_t>(count);
+}
+
 void ProgramImpl::copy_tail(SequenceState& sequence, const Tensor& source) {
     if (source.dtype != DType::BF16 ||
         source.ne[0] != dimension(parameters.model.config().text.hidden_size) ||
@@ -262,6 +294,26 @@ void ProgramImpl::copy_tail(SequenceState& sequence, const Tensor& source) {
 void ProgramImpl::copy_round_token() {
     CUDA_CHECK(cudaMemcpyAsync(host_tokens, io.token.data, sizeof(TokenId), cudaMemcpyDeviceToHost,
                                device.stream));
+}
+
+void ProgramImpl::make_early_token_resources() {
+    if (first_token_ready) { return; }
+    first_token_ready.emplace(device);
+    initial_drafts_ready.reserve(max_concurrency);
+    for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
+        initial_drafts_ready.emplace_back(device);
+    }
+    initial_drafts_host.emplace(static_cast<std::size_t>(max_concurrency) *
+                                qwen3_5::kMtpDecodeMaximumDrafts * sizeof(TokenId));
+}
+
+void ProgramImpl::settle_initial_drafts(SequenceState& sequence) {
+    if (!sequence.mtp_drafts_pending) { return; }
+    initial_drafts_ready.at(sequence.lane).synchronize();
+    const auto* row = static_cast<const TokenId*>(initial_drafts_host->data()) +
+                      static_cast<std::size_t>(sequence.lane) * qwen3_5::kMtpDecodeMaximumDrafts;
+    std::copy_n(row, sequence.mtp_draft_count, sequence.mtp_drafts.begin());
+    sequence.mtp_drafts_pending = false;
 }
 
 void ProgramImpl::mark_workspace_usage(std::size_t phase_bytes) noexcept {
@@ -286,9 +338,8 @@ ProgramImpl::propose_ngram(std::span<const std::uint32_t> lanes,
 }
 
 void ProgramImpl::take_ngram_index(RequestControl& request, PreparedPromptData& prompt) {
-    if (!prompt.ngram_index) {
-        throw std::logic_error("prepared prompt carries no ngram index while ngram drafting is on");
-    }
+    // A prompt prepared for a request that does not draft carries none: that request reads one
+    // token and proposes nothing, and request planning refuses a drafting request without one.
     request.ngram          = std::move(prompt.ngram_index);
     request.ngram_indexed  = prompt.token_ids.size();
     request.ngram_snapshot = std::move(prompt.ngram_snapshot);
@@ -692,6 +743,7 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                 lanes.begin() + static_cast<std::ptrdiff_t>(row)) {
             throw std::invalid_argument("MTP batch contains an invalid or duplicate lane");
         }
+        settle_initial_drafts(active_sequence(lane));
         const SequenceState& sequence = active_sequence(lane);
         const RequestControl& request = requests[lane];
         if (request.lifecycle != Lifecycle::Active ||

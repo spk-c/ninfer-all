@@ -187,6 +187,8 @@ const char* endpoint_name(std::string_view request_path) noexcept {
         path == "/v1/reranking") {
         return "rerank";
     }
+    if (path == "/v1/systemone") { return "systemone"; }
+    if (path == "/v1/decisions") { return "openai_decisions"; }
     if (path == "/v1/responses") { return "openai_responses"; }
     if (path == "/v1/responses/input_tokens") { return "openai_responses_input_tokens"; }
     if (path == "/v1/messages") { return "anthropic_messages"; }
@@ -695,6 +697,14 @@ void HttpServer::register_routes() {
         register_post(endpoint, rerank);
         register_post(api_route_pattern(endpoint), rerank);
     }
+    register_post(api_route_pattern("/systemone"),
+                  [this](const httplib::Request& req, httplib::Response& res) {
+                      handle_decisions(req, res, DecisionDialect::SystemOne);
+                  });
+    register_post(api_route_pattern("/decisions"),
+                  [this](const httplib::Request& req, httplib::Response& res) {
+                      handle_decisions(req, res, DecisionDialect::OpenAI);
+                  });
     register_post(api_route_pattern("/responses"),
                   [this](const httplib::Request& req, httplib::Response& res) {
                       handle_responses(req, res);
@@ -1040,7 +1050,7 @@ void HttpServer::handle_props(const httplib::Request& req, httplib::Response& re
         {"frequency_penalty", overrides.frequency_penalty.value_or(preset.frequency_penalty)},
     };
     params["seed"] = overrides.seed ? nlohmann::json(*overrides.seed) : nlohmann::json(-1);
-    const nlohmann::json props = {
+    nlohmann::json props = {
         {"default_generation_settings",
          {{"n_ctx", facts.capacity.max_context},
           {"speculative",
@@ -1058,6 +1068,10 @@ void HttpServer::handle_props(const httplib::Request& req, httplib::Response& re
         // The WebUI ungreys its "Use llama-server proxy" option from this flag alone.
         {"cors_proxy_enabled", options_.webui_mcp_proxy},
     };
+    // --ui-config-file: the WebUI takes these as its defaults where the user changed nothing.
+    if (!options_.ui_settings.empty()) {
+        props["ui_settings"] = nlohmann::json::parse(options_.ui_settings);
+    }
     res.set_content(props.dump(), "application/json");
 }
 

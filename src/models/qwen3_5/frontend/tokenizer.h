@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -129,6 +130,12 @@ struct BoundaryEncodedText {
     std::vector<TokenBoundaryResult> boundaries;
 };
 
+class OrdinaryRunCache;
+
+// The pre-tokenizer of a byte-level tokenizer: Qwen's one split, or Flint's or DeepSeek's three
+// (digits in groups of up to three, CJK runs, then o200k's words or DeepSeek's).
+enum class ByteLevelSplit : std::uint8_t { Qwen, Flint, DeepSeek };
+
 class Tokenizer {
 public:
     explicit Tokenizer(TokenizerResources resources);
@@ -164,6 +171,9 @@ private:
                             const nlohmann::json& model, TokenizerResources resources);
 
     bool sentencepiece_ = false;
+    // Byte-level: whether ordinary text is NFC-normalized first, and how it splits into words.
+    bool nfc_              = true;
+    ByteLevelSplit split_ = ByteLevelSplit::Qwen;
     std::vector<std::string> decoded_token_bytes_;
     std::vector<bool> valid_token_ids_;
     std::vector<bool> special_token_ids_;
@@ -173,6 +183,10 @@ private:
     std::vector<AddedToken> added_tokens_;
     std::array<std::vector<std::size_t>, 256> added_token_candidates_;
     std::vector<int> default_stop_token_ids_;
+    // The byte-level tokenizer's last long runs of text between added tokens: a later run that
+    // starts with the same text encodes only from where the two can differ (null for
+    // SentencePiece, whose runs are one BPE word each).
+    std::shared_ptr<OrdinaryRunCache> run_cache_;
 };
 
 } // namespace ninfer::models::qwen3_5::frontend

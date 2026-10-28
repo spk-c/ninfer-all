@@ -4,6 +4,8 @@
 #include "models/qwen3_5/frontend/prepared_prompt.h"
 
 #include "models/qwen3_5/frontend/chat_template.h"
+#include "models/qwen3_5/frontend/deepseek_output.h"
+#include "models/qwen3_5/frontend/flint_output.h"
 #include "models/qwen3_5/frontend/gemma_output.h"
 #include "models/qwen3_5/frontend/media_cache.h"
 #include "models/qwen3_5/frontend/processor.h"
@@ -48,6 +50,10 @@ constexpr std::string_view kThinkingControl =
     "\n\n Considering the limited time by the user, I have to give the solution based on the "
     "thinking directly now.\n</think>\n\n";
 static_assert(kThinkingControl.ends_with(fi::kCanonicalReasoningCloseSerialization));
+// DeepSeek-V4.1's early-close guidance, which its </think> token follows.
+constexpr std::string_view kDeepSeekThinkingGuidance =
+    "\n\nConsidering the limited time by the user, I have to give the solution based on the "
+    "thinking directly now.";
 constexpr double kRescaleFactor = 1.0 / 255.0;
 constexpr double kVideoFps      = 2.0;
 constexpr int kVideoMinFrames   = 4;
@@ -229,6 +235,40 @@ fi::GemmaMediaOptions gemma_media_options(const FrontendResources& resources) {
         positive_u64(require_integer(video, "max_soft_tokens", kResource), "max_soft_tokens")));
     out.frames = static_cast<int>(
         positive_u64(integer_or_default(video, "num_frames", kResource, 32), "num_frames"));
+    return out;
+}
+
+// DeepSeek-V4.1's processor_config.json (the converter's transcription of the release's
+// image_processor.py): patches of 14 merged 3 x 3, the minimum pixels and the token budget of an
+// image, no aspect cap, the bicubic resize onto gray 127, values (x / 255 - 0.5) / 0.5.
+fi::DeepSeekMediaOptions deepseek_media_options(const FrontendResources& resources) {
+    constexpr std::string_view kResource = "processor_config.json";
+    const Json config = parse_resource_json(resources.processor_config_json, kResource);
+    const Json& image = require_object(config, "image_processor", kResource);
+    fi::DeepSeekMediaOptions out;
+    const auto values = [&](const char* field, double expected) {
+        const Json& v = image.contains(field) ? image.at(field) : Json();
+        return v.is_array() && v.size() == 3 &&
+               std::all_of(v.begin(), v.end(), [&](const Json& x) {
+                   return x.is_number() && x.get<double>() == expected;
+               });
+    };
+    if (require_integer(image, "patch_size", kResource) != out.patch ||
+        require_integer(image, "downsample_ratio", kResource) != out.merge ||
+        !image.contains("max_wh_ratio") || !image.at("max_wh_ratio").is_null() ||
+        require_integer(image, "resample", kResource) != 3 || !values("pad_color", 127.0) ||
+        !values("image_mean", 0.5) || !values("image_std", 0.5) ||
+        image.value("image_token", std::string()) != fi::kDeepSeekMediaPads.image) {
+        throw std::invalid_argument(
+            "processor_config.json does not match the compiled DeepSeek-V4.1 image processing");
+    }
+    out.min_pixels = positive_u64(require_integer(image, "min_pixels", kResource), "min_pixels");
+    const std::uint64_t tokens =
+        positive_u64(require_integer(image, "max_image_tokens", kResource), "max_image_tokens");
+    if (tokens < 4 || tokens > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::invalid_argument("processor_config.json max_image_tokens is out of range");
+    }
+    out.max_tokens = static_cast<std::uint32_t>(tokens);
     return out;
 }
 
@@ -817,6 +857,7 @@ PreparedTapHints prepare_tap_hints(const ContextCacheHints& hints,
     // shared-prefix publication. Hybrid taps are cheap and content-deduplicated, so explicit
     // markers only add taps; automatic placement is never suppressed.
     PreparedTapHints out;
+    out.disposable = hints.retention == CacheRetentionHint::Disposable;
     out.hints.reserve(message_boundaries.size() + hints.markers.size() + 3U);
     const auto add = [&](std::optional<std::uint32_t> frontier, TapHintKind kind) {
         if (frontier && *frontier != 0) { out.hints.push_back(TapHint{*frontier, kind}); }
@@ -855,6 +896,31 @@ PreparedTapHints prepare_tap_hints(const ContextCacheHints& hints,
 
 ModelSamplingDefaults default_sampling(Architecture architecture) {
     ModelSamplingDefaults sampling;
+    if (architecture == Architecture::Flint) {
+        // Flint's generation_config.json, whether or not it reasons (it decides that itself).
+        sampling.thinking      = {.temperature       = 1.0F,
+                                  .top_k             = 20,
+                                  .top_p             = 0.95F,
+                                  .min_p             = 0.0F,
+                                  .presence_penalty  = 0.0F,
+                                  .frequency_penalty = 0.0F};
+        sampling.non_thinking  = sampling.thinking;
+        sampling.post_thinking = sampling.thinking;
+        return sampling;
+    }
+    if (architecture == Architecture::DeepSeekV41) {
+        // DeepSeek-V4.1's recommended sampling (temperature 1.0, top_p 1.0), thinking or not,
+        // with top_k held at the 20 candidates the sampler keeps.
+        sampling.thinking      = {.temperature       = 1.0F,
+                                  .top_k             = 20,
+                                  .top_p             = 1.0F,
+                                  .min_p             = 0.0F,
+                                  .presence_penalty  = 0.0F,
+                                  .frequency_penalty = 0.0F};
+        sampling.non_thinking  = sampling.thinking;
+        sampling.post_thinking = sampling.thinking;
+        return sampling;
+    }
     if (architecture == Architecture::Gemma4) {
         // generation_config.json of the Gemma 4 releases (top_k 64), thinking or not, with
         // top_k held at the 20 candidates the sampler keeps.
@@ -888,12 +954,16 @@ ModelSamplingDefaults default_sampling(Architecture architecture) {
 class Frontend::Impl {
 public:
     Impl(const FrontendResources& resources, FrontendOptions options)
-        : chat_template(compile_chat_template(resources, options.chat_template_path,
-                                              options.architecture != Architecture::Gemma4)),
+        : chat_template(
+              compile_chat_template(resources, options.chat_template_path,
+                                    options.architecture != Architecture::Gemma4 &&
+                                        options.architecture != Architecture::Flint &&
+                                        options.architecture != Architecture::DeepSeekV41)),
           tokenizer(resources.tokenizer),
-          processor(!options.vision_enabled                        ? fi::ProcessorOptions{}
-                    : options.architecture == Architecture::Gemma4 ? fi::ProcessorOptions{}
-                                                                   : processor_options(resources)),
+          processor(!options.vision_enabled                             ? fi::ProcessorOptions{}
+                    : options.architecture == Architecture::Gemma4      ? fi::ProcessorOptions{}
+                    : options.architecture == Architecture::DeepSeekV41 ? fi::ProcessorOptions{}
+                                                                        : processor_options(resources)),
           vision_enabled(options.vision_enabled), max_context(options.max_context),
           automatic_long_anchors(options.automatic_long_anchors),
           long_anchor_min_spacing_tokens(options.long_anchor_min_spacing_tokens),
@@ -904,7 +974,18 @@ public:
                                         std::to_string(kMinimumProgressAnchorTokens) + " tokens");
         }
         const bool gemma_media = options.architecture == Architecture::Gemma4 && vision_enabled;
-        if (gemma_media) {
+        const bool deepseek_media =
+            options.architecture == Architecture::DeepSeekV41 && vision_enabled;
+        if (deepseek_media) {
+            fi::DeepSeekMediaOptions& d = processor.deepseek.emplace(deepseek_media_options(resources));
+            if (options.vision_max_merged_tokens != 0) {
+                d.max_tokens = std::min(d.max_tokens, options.vision_max_merged_tokens);
+            }
+            if (d.max_tokens < 4) {
+                throw std::invalid_argument("--vision-max-merged: a DeepSeek-V4.1 image takes at "
+                                            "least 4 prompt positions");
+            }
+        } else if (gemma_media) {
             fi::GemmaMediaOptions& g = processor.gemma.emplace(gemma_media_options(resources));
             g.max_tokens   = fi::gemma_budget_at_most(options.vision_max_merged_tokens);
             g.image_tokens = std::min(g.image_tokens, g.max_tokens);
@@ -918,13 +999,15 @@ public:
         const std::uint64_t vision_tokens =
             std::min<std::uint64_t>(options.max_context, kMaximumPromptVisionTokens);
         // Raw patches per soft token and values per patch: Gemma 4 pools 3 x 3 patches of
-        // 3 x 16 x 16, Qwen merges 2 x 2 patches of 2 x 3 x 16 x 16.
+        // 3 x 16 x 16, DeepSeek-V4.1 merges 3 x 3 of 3 x 14 x 14, Qwen 2 x 2 of 2 x 3 x 16 x 16.
         const std::uint64_t patches_per_token =
-            gemma_media ? std::uint64_t(processor.gemma->pooling) * processor.gemma->pooling
-                  : kRawPatchesPerVisionToken;
+            deepseek_media ? std::uint64_t(processor.deepseek->merge) * processor.deepseek->merge
+            : gemma_media  ? std::uint64_t(processor.gemma->pooling) * processor.gemma->pooling
+                           : kRawPatchesPerVisionToken;
         const std::uint64_t patch_features =
-            gemma_media ? std::uint64_t(3) * processor.gemma->patch * processor.gemma->patch
-                  : kPreparedVisionPatchFeatures;
+            deepseek_media ? std::uint64_t(3) * processor.deepseek->patch * processor.deepseek->patch
+            : gemma_media  ? std::uint64_t(3) * processor.gemma->patch * processor.gemma->patch
+                           : kPreparedVisionPatchFeatures;
         processor.max_vision_tokens = vision_tokens;
         processor.max_raw_patches   = vision_tokens * patches_per_token;
         if (vision_enabled) {
@@ -964,6 +1047,45 @@ public:
         if (options.architecture == Architecture::Gemma4) {
             // Gemma's reasoning channel has no early-close control: thinking budgets do not apply.
             gemma = std::make_shared<const fi::GemmaMarkers>(fi::GemmaMarkers::from(*tokenizer));
+            return;
+        }
+        if (options.architecture == Architecture::Flint) {
+            // Flint opens its reasoning when it decides to, with no early-close control: thinking
+            // budgets do not apply either.
+            flint = std::make_shared<const fi::FlintMarkers>(fi::FlintMarkers::from(*tokenizer));
+            if (flint->think_open < 0 || flint->think_close < 0) {
+                throw std::invalid_argument("Flint's tokenizer lacks its <think> markers");
+            }
+            return;
+        }
+        if (options.architecture == Architecture::DeepSeekV41) {
+            // DeepSeek-V4.1's prompt opens its reasoning as Qwen's does, and its tool calls are
+            // DSML. A reached thinking budget closes the reasoning with Qwen's guidance (or
+            // --thinking-budget-message) and DeepSeek's </think> token, and the model answers.
+            deepseek =
+                std::make_shared<const fi::DeepSeekMarkers>(fi::DeepSeekMarkers::from(*tokenizer));
+            if (deepseek->think_close < 0) {
+                throw std::invalid_argument("DeepSeek-V4.1's tokenizer lacks its </think> marker");
+            }
+            std::string guidance(kDeepSeekThinkingGuidance);
+            if (!options.thinking_budget_message.empty()) {
+                guidance = options.thinking_budget_message;
+                // The close is the token appended below, not the message's own spelling of it.
+                if (const auto close = guidance.find(kThinkClose); close != std::string::npos) {
+                    guidance.erase(close);
+                }
+            }
+            std::vector<TokenId> encoded = tokenizer->encode(guidance);
+            encoded.push_back(deepseek->think_close);
+            for (const TokenId token : encoded) {
+                if (std::find(defaults.token_ids.begin(), defaults.token_ids.end(), token) !=
+                    defaults.token_ids.end()) {
+                    throw std::invalid_argument("thinking budget message contains a default "
+                                                "terminal token");
+                }
+            }
+            thinking_control_tokens =
+                std::make_shared<const std::vector<TokenId>>(std::move(encoded));
             return;
         }
         std::string control_suffix(kThinkingControl);
@@ -1013,7 +1135,10 @@ public:
 
     // The syntax the model writes its calls in, which a forced call's opener has to match.
     [[nodiscard]] fi::ToolCallSyntax tool_call_syntax() const noexcept {
-        return gemma ? fi::ToolCallSyntax::Gemma : fi::ToolCallSyntax::Qwen;
+        return gemma      ? fi::ToolCallSyntax::Gemma
+               : flint    ? fi::ToolCallSyntax::Flint
+               : deepseek ? fi::ToolCallSyntax::DeepSeek
+                          : fi::ToolCallSyntax::Qwen;
     }
 
     // The graft a request names, or null for none.
@@ -1035,6 +1160,8 @@ public:
     ModelSamplingDefaults sampling;
     std::shared_ptr<const std::vector<TokenId>> thinking_control_tokens;
     std::shared_ptr<const fi::GemmaMarkers> gemma; // the Gemma 4 dialect, null for Qwen
+    std::shared_ptr<const fi::FlintMarkers> flint; // the Flint dialect, null for Qwen
+    std::shared_ptr<const fi::DeepSeekMarkers> deepseek; // the DeepSeek dialect, null for Qwen
     bool ngram_sources_enabled = false;
     bool ngram_archive_enabled = false;
     std::vector<TokenId> ngram_think_open, ngram_think_close;
@@ -1157,6 +1284,81 @@ std::unique_ptr<NgramArchive::Request> PreparedPrompt::bind_ngram(NgramArchive& 
     return request;
 }
 
+BranchedPrompt split_branches(std::vector<PreparedPrompt> prompts) {
+    if (prompts.empty()) { throw std::invalid_argument("branched prompts are empty"); }
+    std::size_t shared = std::numeric_limits<std::size_t>::max();
+    for (const PreparedPrompt& prompt : prompts) {
+        const PreparedPromptData& data = PreparedPromptAccess::view(prompt);
+        if (data.has_media()) { throw std::invalid_argument("branched prompts must be text"); }
+        if (data.token_ids.size() < 2) {
+            throw std::invalid_argument("a branched prompt needs a token after the shared prefix");
+        }
+        shared = std::min(shared, data.token_ids.size() - 1U);
+    }
+    const std::vector<TokenId>& first = PreparedPromptAccess::view(prompts.front()).token_ids;
+    for (std::size_t index = 1; index < prompts.size(); ++index) {
+        const std::vector<TokenId>& other = PreparedPromptAccess::view(prompts[index]).token_ids;
+        std::size_t agree                 = 0;
+        while (agree < shared && first[agree] == other[agree]) { ++agree; }
+        shared = agree;
+    }
+    PreparedPromptData data = PreparedPromptAccess::take(std::move(prompts.front()));
+    std::uint32_t prefix    = 0;
+    for (const PreparedCacheOpportunity& opportunity : data.context_cache.opportunities) {
+        if (opportunity.kind == PromptCacheMarkerKind::SharedStablePrefix &&
+            has_shared_candidate_evidence(opportunity.evidence,
+                                          SharedCandidateEvidence::ExplicitBoundary) &&
+            opportunity.frontier <= shared) {
+            prefix = std::max(prefix, opportunity.frontier);
+        }
+    }
+    if (prefix == 0) { prefix = checked_token_count(shared); }
+
+    BranchedPrompt out;
+    out.suffixes.reserve(prompts.size());
+    out.suffixes.emplace_back(data.token_ids.begin() + prefix, data.token_ids.end());
+    for (std::size_t index = 1; index < prompts.size(); ++index) {
+        const std::vector<TokenId>& tokens = PreparedPromptAccess::view(prompts[index]).token_ids;
+        out.suffixes.emplace_back(tokens.begin() + prefix, tokens.end());
+        const PrepareStats& stats = PreparedPromptAccess::view(prompts[index]).prepare;
+        data.prepare.seconds += stats.seconds;
+        data.prepare.tokenize_seconds += stats.tokenize_seconds;
+    }
+
+    const std::size_t count = data.token_ids.size();
+    std::vector<std::int32_t> positions(std::size_t{3} * prefix);
+    for (std::size_t axis = 0; axis < 3; ++axis) {
+        std::copy_n(data.positions.begin() + static_cast<std::ptrdiff_t>(axis * count), prefix,
+                    positions.begin() + static_cast<std::ptrdiff_t>(axis * prefix));
+    }
+    data.positions = std::move(positions);
+    data.token_ids.resize(prefix);
+    data.token_types.resize(prefix);
+    const auto beyond = [prefix](std::uint32_t frontier) { return frontier > prefix; };
+    std::erase_if(
+        data.context_cache.opportunities,
+        [&](const PreparedCacheOpportunity& opportunity) { return beyond(opportunity.frontier); });
+    std::erase_if(data.tap_hints.hints, [&](const runtime::prefix_cache::TapHint& hint) {
+        return beyond(hint.position);
+    });
+    std::erase_if(data.identity.rewrite_execution_frontiers, beyond);
+    if (data.identity.rewrite_checkpoint && beyond(data.identity.rewrite_checkpoint->frontier)) {
+        data.identity.rewrite_checkpoint.reset();
+    }
+    if (data.graft_frontier > prefix) {
+        data.graft_name.clear();
+        data.graft_frontier = 0;
+    }
+    // A read drafts nothing: it takes no n-gram index or archive views.
+    data.ngram_archive_sources.clear();
+    data.ngram_snapshot.reset();
+    data.ngram_sources.clear();
+    data.ngram_index.reset();
+    detail::prompt_block_keys(data, data.block_hashes, data.block_extras);
+    out.prefix = PreparedPrompt(std::make_unique<PreparedPromptData>(std::move(data)));
+    return out;
+}
+
 PreparedPromptData PreparedPromptAccess::take(PreparedPrompt&& prompt) {
     if (prompt.data_ == nullptr) { throw std::invalid_argument("prepared prompt is empty"); }
     auto data = std::move(prompt.data_);
@@ -1209,7 +1411,9 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
     auto prepared              = std::make_unique<PreparedPromptData>();
     PreparedPromptData& result = *prepared;
     result.tool_call_output    = tool_call_output;
-    if (impl_->ngram_sources_enabled) {
+    // A request that does not draft reads one token: it needs no proposal sources or index.
+    const bool drafts_ngrams = impl_->ngram_sources_enabled && options.speculative_drafting;
+    if (drafts_ngrams) {
         result.ngram_boundaries = impl_->ngram_boundaries;
         std::size_t remaining   = impl_->max_context;
         for (const auto& message : messages) {
@@ -1308,7 +1512,7 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
     // request builds on, so it publishes no prefix of its own; a prefill graft is replayed, and its
     // end is published as a shared prefix.
     const bool is_direct_graft = graft && graft->kind != GraftKind::PrefillKV;
-    if (impl_->ngram_archive_enabled) {
+    if (impl_->ngram_archive_enabled && options.speculative_drafting) {
         const std::span<const TokenId> tokens(result.token_ids);
         auto add = [&](std::span<const TokenId> span, NgramSourceKind kind, int priority) {
             if (static_cast<int>(kind) == priority && span.size() >= 4 &&
@@ -1372,7 +1576,7 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
         impl_->long_anchor_min_spacing_tokens, impl_->progress_anchor_tokens,
         (graft && !is_direct_graft) ? graft_context_slots(*graft) : 0U,
         is_direct_graft ? graft_context_slots(*graft) : 0U);
-    if (impl_->ngram_sources_enabled) {
+    if (drafts_ngrams) {
         fi::check_preparation_control(control, "ngram index");
         build_ngram_index(result);
     }
@@ -1434,7 +1638,7 @@ MediaCacheSummary Frontend::media_cache_summary() const {
 }
 
 PreparedPrompt Frontend::prepare_tokens(std::vector<TokenId> token_ids, bool allow_prefix_identity,
-                                        bool anchor_prompt_end) const {
+                                        bool anchor_prompt_end, bool speculative_drafting) const {
     const auto start = Clock::now();
     if (token_ids.size() > impl_->max_context) {
         throw_context_length_exceeded(impl_->max_context);
@@ -1449,11 +1653,11 @@ PreparedPrompt Frontend::prepare_tokens(std::vector<TokenId> token_ids, bool all
     auto prepared              = std::make_unique<PreparedPromptData>();
     PreparedPromptData& result = *prepared;
     result.token_ids           = std::move(token_ids);
-    if (impl_->ngram_sources_enabled) {
+    if (impl_->ngram_sources_enabled && speculative_drafting) {
         result.ngram_boundaries = impl_->ngram_boundaries;
         build_ngram_index(result);
     }
-    if (impl_->ngram_archive_enabled) {
+    if (impl_->ngram_archive_enabled && speculative_drafting) {
         result.ngram_archive_sources.push_back({result.token_ids, NgramSourceKind::Text});
     }
     assign_text_positions(result);
@@ -1490,6 +1694,22 @@ std::string Frontend::token_bytes(TokenId token) const {
     return std::string(impl_->tokenizer->decode_token_bytes(token, false));
 }
 
+TokenLogprob Frontend::token_logprob(const runtime::RawTokenLogprob& raw) const {
+    TokenLogprob record;
+    record.id         = raw.id;
+    record.logprob    = raw.logprob;
+    record.bytes      = token_bytes(raw.id);
+    record.top_ids    = raw.top_ids;
+    record.top_values = raw.top_values;
+    for (std::size_t k = 0; k < kMaximumTokenLogprobs; ++k) {
+        if (raw.top_ids[k] >= 0) { record.top_bytes[k] = token_bytes(raw.top_ids[k]); }
+    }
+    const std::size_t count = std::min<std::size_t>(raw.readout_count, kMaximumReadoutTokens);
+    record.readout.assign(raw.readout_values.begin(),
+                          raw.readout_values.begin() + static_cast<std::ptrdiff_t>(count));
+    return record;
+}
+
 OutputSession Frontend::make_output_session(const PreparedPrompt& prompt,
                                             const StopPolicy& caller_stop,
                                             const OutputOptions& output,
@@ -1501,9 +1721,15 @@ OutputSession Frontend::make_output_session(const PreparedPrompt& prompt,
     text::validate_structured_output(structured);
     const auto& tools       = prompt.data_->tool_call_output;
     const bool strict_tools = tools && fi::has_strict_tools(*tools);
-    if (strict_tools && impl_->gemma) {
-        throw std::invalid_argument(
-            "strict tool arguments need Qwen's tool-call syntax, which Gemma 4 does not use");
+    if (strict_tools && (impl_->gemma || impl_->flint)) {
+        throw std::invalid_argument("strict tool arguments need Qwen's or DeepSeek's tool-call "
+                                    "syntax, which " +
+                                    std::string(impl_->gemma ? "Gemma 4" : "Flint") +
+                                    " does not use");
+    }
+    if (structured.kind != StructuredOutputKind::None && tools && impl_->flint) {
+        throw std::invalid_argument("structured output beside tool calls needs Qwen's or "
+                                    "DeepSeek's tool-call syntax, which Flint does not use");
     }
     if (structured.kind != StructuredOutputKind::None || strict_tools) {
         if (structured.kind != StructuredOutputKind::None &&
@@ -1516,7 +1742,9 @@ OutputSession Frontend::make_output_session(const PreparedPrompt& prompt,
         text::StructuredOutputEnvelope envelope;
         if (prompt.data_->starts_in_reasoning) { envelope.reasoning_close = "</think>"; }
         if (structured.kind != StructuredOutputKind::None && tools) {
-            envelope.alternative_format = fi::structured_tool_call_format(*tools);
+            envelope.alternative_format = impl_->deepseek
+                                              ? fi::deepseek_structured_tool_call_format(*tools)
+                                              : fi::structured_tool_call_format(*tools);
         }
         std::lock_guard lock(impl_->grammar_mutex);
         if (!impl_->grammar_compiler) {
@@ -1533,14 +1761,16 @@ OutputSession Frontend::make_output_session(const PreparedPrompt& prompt,
         }
         grammar = structured.kind != StructuredOutputKind::None
                       ? impl_->grammar_compiler->compile(structured, envelope)
-                      : impl_->grammar_compiler->compile_format(fi::tool_call_text_format(*tools),
-                                                                envelope);
+                      : impl_->grammar_compiler->compile_format(
+                            impl_->deepseek ? fi::deepseek_tool_call_text_format(*tools)
+                                            : fi::tool_call_text_format(*tools),
+                            envelope);
     }
     if (output.raw) { policy.publish_stop_token = true; }
     return OutputSession(impl_->tokenizer, std::move(policy), output,
                          prompt.data_->starts_in_reasoning, thinking,
                          impl_->thinking_control_tokens, prompt.data_->tool_call_output,
-                         std::move(grammar), impl_->gemma);
+                         std::move(grammar), impl_->gemma, impl_->flint, impl_->deepseek);
 }
 
 const StopPolicy& Frontend::default_stop_policy() const noexcept { return impl_->defaults; }

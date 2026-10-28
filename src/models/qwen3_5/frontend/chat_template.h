@@ -4,7 +4,7 @@
 #include "text/jinja.h"
 
 #include "models/qwen3_5/frontend/prepared_prompt.h"
-#include <ninfer/types.h>
+#include "ninfer/request.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -94,8 +94,10 @@ struct ChatMessage {
 
 // The syntax a model writes its tool calls in, which decides how a forced call is opened.
 enum class ToolCallSyntax : std::uint8_t {
-    Qwen,  // <tool_call>\n<function=NAME>\n ...
-    Gemma, // <|tool_call>call:NAME{ ...
+    Qwen,     // <tool_call>\n<function=NAME>\n ...
+    Gemma,    // <|tool_call>call:NAME{ ...
+    Flint,    // <tool_call>NAME<arg_key> ...
+    DeepSeek, // \n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name="NAME">\n ...
 };
 
 struct ChatRenderOptions {

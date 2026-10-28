@@ -190,6 +190,7 @@ gguf::GgmlType gguf_type(QType format) {
         return gguf::GgmlType::Q5_0;
     case QType::GGUF_Q2_0:
         return gguf::GgmlType::Q2_0;
+    case QType::GGUF_MXFP4: return gguf::GgmlType::MXFP4;
     default: break;
     }
     throw std::invalid_argument("gguf: not a GGUF block format");
@@ -349,6 +350,15 @@ void gguf_project(const Tensor& x, std::span<const GgufProduct> products,
                 activations.push_back({layout, w.input_columns, data});
                 found = activations.end() - 1;
             }
+            if (p.f32 == nullptr &&
+                (p.epilogue == GgufEpilogue::Store || p.epilogue == GgufEpilogue::Accumulate)) {
+                const gguf::VectorOutput destination = output(p, 0);
+                gguf::matrix_product_bf16(type, w.qdata, row_bytes(w), w.n, k, found->data, t,
+                                          destination.bf16, destination.column_stride, plane, fixup,
+                                          stream, p.epilogue == GgufEpilogue::Accumulate,
+                                          k % 256 != 0);
+                continue;
+            }
             gguf::matrix_product(type, w.qdata, row_bytes(w), w.n, k, found->data, t, out, stride,
                                  fixup, stream, k % 256 != 0);
         } else if (t <= kDequantizedVectorColumns) {
@@ -377,7 +387,14 @@ void gguf_project(const Tensor& x, std::span<const GgufProduct> products,
 
 void gguf_linear(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& workspace,
                  cudaStream_t stream) {
-    const GgufProduct product{&w, &out, 0, GgufEpilogue::Store};
+    GgufProduct product{&w, &out, 0, GgufEpilogue::Store};
+    if (out.dtype == DType::FP32) {
+        if (!out.is_contiguous() || out.ne[0] != w.n || out.ne[1] != x.ne[1]) {
+            throw std::invalid_argument("gguf linear: an FP32 out must be contiguous [N,T]");
+        }
+        product.f32      = static_cast<float*>(out.data);
+        product.f32_rows = out.ne[0];
+    }
     gguf_project(x, {&product, 1}, workspace, stream);
 }
 

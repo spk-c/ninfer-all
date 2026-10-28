@@ -1,7 +1,13 @@
 #pragma once
 
 #include "core/device_snapshot.h"
-#include "ninfer/types.h"
+#include "ninfer/base.h"
+#include "ninfer/observability/execution.h"
+#include "ninfer/observability/resources.h"
+#include "ninfer/observability/snapshot.h"
+#include "ninfer/request.h"
+#include "ninfer/startup.h"
+#include "ninfer/types_fwd.h"
 #include "runtime/contract/execution.h"
 #include "runtime/contract/resources.h"
 #include "models/qwen3_5/frontend/graft.h"
@@ -862,6 +868,16 @@ struct PrefillProgress {
     runtime::ExecutionTiming timing;
     std::optional<PendingBatch> pending;
     std::optional<CaptureOffer> capture;
+    // A completed branched read: one record per branch, in branch order.
+    std::vector<runtime::RawTokenLogprob> branches;
+};
+
+// One sequence's share of a shared prefill pass (Program::prefill_batch_unit).
+struct PrefillBatchUnit {
+    std::uint32_t tokens   = 0;
+    std::uint32_t segments = 0;
+    // A branched read: its step runs as a shared pass even alone.
+    bool branched = false;
 };
 
 enum class CaptureStatePlacement : std::uint8_t {
@@ -1089,6 +1105,30 @@ public:
     [[nodiscard]] bool wait_context_transfer() noexcept;
     [[nodiscard]] PrefillProgress
     advance_prefill(SequenceHandle sequence, runtime::ExecutionTiming* failed_timing = nullptr);
+    // The columns and segments a sequence's next prefill step adds to a pass shared with other
+    // sequences' last chunks; empty when its step must run alone (a media prompt, a capture or tap
+    // inside the rest of the prompt, drafter work, more than one chunk left, ...). A branched read
+    // (ResolvedExecutionOptions::branches) contributes the rest of its prompt and the branches
+    // that fit one pass after it, and its steps always run as such a pass, alone or shared.
+    [[nodiscard]] std::optional<PrefillBatchUnit>
+    prefill_batch_unit(SequenceHandle sequence) const noexcept;
+    // The most columns and segments one shared pass computes.
+    [[nodiscard]] std::uint32_t prefill_batch_capacity() const noexcept;
+    [[nodiscard]] std::uint32_t prefill_batch_segments() const noexcept;
+    // Whether a branched read (ResolvedExecutionOptions::branches) can run: its steps need the
+    // shared pass, which a staged Program does not have.
+    [[nodiscard]] bool runs_branched_reads() const noexcept;
+    // Branch tokens a branched read has left to compute.
+    [[nodiscard]] std::uint32_t pending_branch_tokens(SequenceHandle sequence) const noexcept;
+    // Runs each sequence's unit in one pass over the model: the rest of an ordinary prompt and its
+    // first token, or a branched read's prompt part and next branches; every sequence must be
+    // admitted by prefill_batch_unit, together within prefill_batch_capacity columns and
+    // kMaximumPrefillSegments segments. Each sequence's next advance_prefill then returns its step
+    // without device work, complete once its first token (all branches) is read. A failure
+    // releases every member's lane.
+    [[nodiscard]] runtime::ExecutionTiming
+    prefill_batch(std::span<const SequenceHandle> sequences,
+                  runtime::ExecutionTiming* failed_timing = nullptr);
     [[nodiscard]] CaptureAssessment
     inspect_capture(const CaptureOffer& offer, const SharedPrefixHandle* exact_shared,
                     const SharedPrefixHandle* replacement,

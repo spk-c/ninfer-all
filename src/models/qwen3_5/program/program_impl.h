@@ -207,6 +207,19 @@ struct CaptureAssessmentImpl {
     PhysicalResources capacity_preparation_removed;
 };
 
+// The most tokens a branched read's branches extend its prompt by; zero without branches.
+[[nodiscard]] inline std::uint32_t
+branch_extent(const std::vector<runtime::ReadBranch>* branches) noexcept {
+    std::size_t extent = 0;
+    if (branches != nullptr) {
+        for (const runtime::ReadBranch& branch : *branches) {
+            extent = std::max(extent, branch.tokens.size());
+        }
+    }
+    return static_cast<std::uint32_t>(
+        std::min<std::size_t>(extent, std::numeric_limits<std::uint32_t>::max()));
+}
+
 struct RequestBasePlanImpl {
     runtime::RequestPlanSummary summary;
     detail::PhysicalDemand root_demand;
@@ -217,6 +230,14 @@ struct RequestBasePlanImpl {
     std::shared_ptr<text::GrammarState> grammar;
     // The request asked for each generated token's log probability.
     bool logprobs = false;
+    // With logprobs: the token ids read out exactly on the first generated token.
+    std::vector<TokenId> readout_tokens;
+    // A branched read's branches (runtime::ResolvedExecutionOptions::branches), or null.
+    std::shared_ptr<const std::vector<runtime::ReadBranch>> branches;
+    // The speculative drafter serves this request (ExecutionOptions::speculative_drafting, or a
+    // Program without one). Without it, the drafter's prompt work stops at the deepest cache entry
+    // the request publishes.
+    bool drafting                             = true;
     std::uint32_t text_kv_page_entitlement    = 0;
     std::uint32_t backend_kv_page_entitlement = 0;
     std::shared_ptr<const qwen3_5::VisionControlPlan> vision_control_plan;
@@ -283,6 +304,9 @@ struct AdmissionCandidateImpl : ResourceCandidateState {
     ops::SamplingConfig sampling;
     std::shared_ptr<text::GrammarState> grammar;
     bool logprobs                             = false;
+    std::vector<TokenId> readout_tokens;
+    std::shared_ptr<const std::vector<runtime::ReadBranch>> branches;
+    bool drafting                             = true;
     std::uint32_t text_kv_page_entitlement    = 0;
     std::uint32_t backend_kv_page_entitlement = 0;
     runtime::LaneId destination{};
@@ -305,6 +329,9 @@ struct HybridQuoteImpl {
     ops::SamplingConfig sampling;
     std::shared_ptr<text::GrammarState> grammar;
     bool logprobs                             = false;
+    std::vector<TokenId> readout_tokens;
+    std::shared_ptr<const std::vector<runtime::ReadBranch>> branches;
+    bool drafting                             = true;
     std::uint32_t text_kv_page_entitlement    = 0;
     std::uint32_t backend_kv_page_entitlement = 0;
     std::shared_ptr<const qwen3_5::VisionControlPlan> vision_control_plan;
@@ -332,6 +359,8 @@ struct HybridPendingTap {
 struct HybridLaneState {
     bool active  = false;
     bool publish = false;
+    // PreparedTapHints::disposable: the snapshot it resumed from is never superseded.
+    bool disposable = false;
     // Root path of full blocks this sequence pins, in prompt order. Blocks past the reuse
     // frontier are appended as the sequence commits them.
     std::vector<runtime::prefix_cache::NodeRef> path;
@@ -483,6 +512,8 @@ struct SequenceState {
     std::uint32_t dflash_context_frontier = 0;
     std::array<TokenId, qwen3_5::kMtpDecodeMaximumDrafts> mtp_drafts{};
     std::uint32_t mtp_draft_count = 0;
+    // The initial drafts are still on their way from the device (settle_initial_drafts).
+    bool mtp_drafts_pending       = false;
     bool tail_hidden_valid        = false;
     bool endpoint_valid           = false;
     RewriteCheckpoint rewrite_checkpoint;
@@ -542,6 +573,11 @@ struct RequestControl {
     std::uint32_t next_mask_frontier = 0;
     std::chrono::steady_clock::time_point next_mask_started;
     bool logprobs = false;
+    // The typed readout's token ids; read on the sequence's first generated token only.
+    std::vector<TokenId> readout_tokens;
+    // A branched read: after the prompt, each branch runs as a block over it and its first
+    // generated token is read (runtime::ResolvedExecutionOptions::branches); null otherwise.
+    std::shared_ptr<const std::vector<runtime::ReadBranch>> branches;
     GenerationTimings timings;
     SpeculativeStats speculative_stats;
     // Adaptive MTP: how far this request's drafts survive.
@@ -577,10 +613,32 @@ struct RequestControl {
         std::uint32_t hidden_replay_tokens  = 0;
         std::uint32_t prompt_tokens         = 0;
         std::uint32_t initial_mtp_extent    = 0;
+        // A request without drafting runs the drafter's prompt work (the MTP bridge and KV, the
+        // DFlash context) only below this frontier, the deepest cache entry it may publish; every
+        // prefill pass lies wholly below or above it. Empty: over the whole prompt.
+        std::optional<std::uint32_t> drafter_frontier;
         double elapsed_seconds              = 0.0;
         bool prepare_mtp                    = false;
         ReusePath reuse                     = ReusePath::Root;
         MtpBridgeMode mtp_bridge            = MtpBridgeMode::None;
+        // Set once a batched pass (advance_prefill_batch) has computed the rest of the prompt:
+        // the KV and state reach the prompt frontier, and the sampled token waits here for the
+        // lane's next advance_prefill, which completes the step without device work.
+        struct Batched {
+            TokenId token = 0;
+            runtime::RawTokenLogprob logprob;
+            std::uint32_t processed_prompt_tokens = 0;
+            // False when a branched read still has branches to run: the step reports the
+            // prompt tokens the pass computed and stays incomplete.
+            bool complete = true;
+        };
+        std::optional<Batched> batched;
+        // A branched read: the next branch a pass computes, and the records of those computed.
+        // Its prompt ends without sampling; the branches then run in one pass or several.
+        std::size_t next_branch = 0;
+        std::vector<runtime::RawTokenLogprob> branch_records;
+        // A pass computed the prompt's last column, so the tail hidden is the prompt frontier's.
+        bool branch_tail = false;
     };
 
     std::optional<Prefill> prefill;
@@ -595,6 +653,7 @@ struct RequestControl {
         mask_cost            = {};
         next_mask_frontier   = 0;
         logprobs             = false;
+        branches.reset();
         active_resources     = {};
         optional_resources   = {};
         publish_continuation = true;
@@ -711,6 +770,13 @@ public:
     void release_seal_window() noexcept;
     [[nodiscard]] PrefillProgress advance_prefill(SequenceHandle sequence,
                                                   runtime::ExecutionTiming* failed_timing);
+    // The sequence's share of a batched pass (advance_prefill_batch), or empty.
+    [[nodiscard]] std::optional<PrefillBatchUnit>
+    prefill_batch_unit(SequenceHandle sequence) const noexcept;
+    [[nodiscard]] std::uint32_t pending_branch_tokens(SequenceHandle sequence) const noexcept;
+    [[nodiscard]] runtime::ExecutionTiming
+    prefill_batch(std::span<const SequenceHandle> sequences,
+                  runtime::ExecutionTiming* failed_timing);
     [[nodiscard]] CaptureAssessment
     inspect_capture(const CaptureOffer& offer, const SharedPrefixHandle* exact_shared,
                     const SharedPrefixHandle* replacement,
@@ -987,6 +1053,19 @@ public:
         round_logprobs{};
     std::optional<PinnedHostBuffer> logprobs_host;
     std::optional<bool> logprobs_armed;
+    // The host copy of a prefill's typed readout (io.readout_values).
+    std::optional<PinnedHostBuffer> readout_host;
+    // A prompt's first token leaves the device ahead of the drafter's work on the prompt's end:
+    // `first_token_ready` follows its copies, and each lane's initial drafts land in its row of
+    // `initial_drafts_host` behind `initial_drafts_ready[lane]`. Made on first use.
+    std::optional<CudaCompletionEvent> first_token_ready;
+    std::vector<CudaCompletionEvent> initial_drafts_ready;
+    std::optional<PinnedHostBuffer> initial_drafts_host;
+    // A batched prefill's outputs (execution::PrefillBatchHost), kMaximumPrefillSegments rows.
+    std::optional<PinnedHostBuffer> prefill_batch_host;
+    // A completed branched read's records; its returned round's branches span points here until
+    // the step is wrapped.
+    std::vector<runtime::RawTokenLogprob> branch_round;
 
     std::optional<PinnedHostBuffer> ordinary_host;
     qwen3_5::OrdinaryDecodeIngress* ordinary_host_ingress = nullptr;
@@ -1693,8 +1772,18 @@ private:
     void fetch_logprobs(std::int32_t rows);
     // The fetched record of gather row `row`, for the token that row produced.
     [[nodiscard]] runtime::RawTokenLogprob fetched_logprob(std::int32_t row, TokenId token) const;
+    // Uploads a request's readout token ids ahead of its prefill and returns their count.
+    std::int32_t arm_readout(std::span<const TokenId> ids);
+    // Copies the first `count` readout values to the host, ordered after the enqueued prefill.
+    void fetch_readout(std::int32_t count);
+    // Attaches the fetched readout values of batched prefill row `row` to its token's record.
+    void attach_readout(runtime::RawTokenLogprob& record, std::int32_t count,
+                        std::int32_t row = 0) const;
     void copy_tail(SequenceState& sequence, const Tensor& source);
     void copy_round_token();
+    void make_early_token_resources();
+    // Waits for a lane's initial drafts if they are still landing and takes them.
+    void settle_initial_drafts(SequenceState& sequence);
     void
     commit_generated_prefix_identity(SequenceState& sequence, std::uint32_t base_ledger_frontier,
                                      std::span<const TokenId> accepted_tokens,
@@ -1707,6 +1796,24 @@ private:
     [[nodiscard]] runtime::PrefillStepResult
     advance_prefill(SequenceState& sequence, RequestControl& request,
                     runtime::ExecutionTiming* failed_timing);
+    // The lane's share of one pass shared with others: the rest of its prompt, or a branched
+    // read's prompt part and the branches that fit after it.
+    [[nodiscard]] std::optional<PrefillBatchUnit> prefill_batch_unit(std::uint32_t lane) const;
+    // One pass computing each lane's unit (every lane prefill_batch_unit admits, together within
+    // one prefill chunk and kMaximumPrefillSegments segments): the rest of a prompt and its first
+    // token, or a branched read's prompt part and next branches' first tokens; each lane's next
+    // advance_prefill returns its step.
+    [[nodiscard]] runtime::ExecutionTiming
+    advance_prefill_batch(std::span<const std::uint32_t> lanes,
+                          runtime::ExecutionTiming* failed_timing);
+    // The bookkeeping of a step that sampled the lane's first token, host_tokens[0] (and with
+    // logprobs round_logprobs[0]): the ledger, the Begin candidate and the step result.
+    [[nodiscard]] runtime::PrefillStepResult
+    complete_prefill_step(SequenceState& sequence, RequestControl& request,
+                          const runtime::BeginSummary& summary,
+                          std::uint32_t processed_prompt_tokens,
+                          std::span<const TokenId> initial_drafts, bool drafts_pending,
+                          runtime::ExecutionTimingRecorder& timing);
     void enqueue_dflash_context_append(std::span<const std::uint32_t> lanes,
                                        std::span<const std::uint32_t> starts,
                                        std::span<const std::uint32_t> counts);

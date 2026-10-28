@@ -1,7 +1,8 @@
 #pragma once
 
 #include "models/qwen3_5/model.h"
-#include "ninfer/types.h"
+#include "ninfer/kv_cache_storage.h"
+#include "ninfer/startup.h"
 #include "ops/common/device_tier.h"
 
 #include <filesystem>
@@ -65,11 +66,25 @@ struct StageSizing {
     // Recurrent-state slots each Linear Attention layer holds: concurrent requests plus the device
     // state slots the context cache keeps.
     std::uint32_t state_slots = 1;
+    // Tensor parallelism: the tokens of KV cache rank 0 holds for the attention layers (the longest
+    // context times the concurrent requests).
+    std::uint64_t kv_tokens = 0;
 };
 [[nodiscard]] std::vector<std::uint32_t> default_stage_layers(const artifact::Reader& reader,
                                                               LoadOptions options,
                                                               const StageSizing& sizing,
                                                               std::span<const std::uint64_t> free_bytes);
+// The relative share of each of `speed.size()` tensor-parallel ranks (the default
+// `--tensor-split`): in proportion to `speed` (rank_copy_bandwidth), but no more of the divided
+// weights, recurrent state and KV cache than fits beside what a rank holds whole (rank 0: the
+// embedding and the head), sized from the artifact like default_stage_layers. When the model fits
+// nowhere, the shares follow speed alone and the Program's planning reports the device that runs
+// out.
+[[nodiscard]] std::vector<double> default_tensor_split(const artifact::Reader& reader,
+                                                       LoadOptions options,
+                                                       const StageSizing& sizing,
+                                                       std::span<const std::uint64_t> free_bytes,
+                                                       std::span<const double> speed);
 // `materialize` makes the weight arenas suspendable when asked (see Model::release_device_weights).
 [[nodiscard]] std::unique_ptr<Model>
 materialize_model(LoadPlan&& plan, DeviceContext& device, const StartupObserver* observer = nullptr,

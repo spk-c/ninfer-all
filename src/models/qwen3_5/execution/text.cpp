@@ -22,6 +22,7 @@
 #include "ninfer/ops/gdn_gating_proj.h"
 #include "ninfer/ops/gdn_input_proj.h"
 #include "ninfer/ops/logprob_topk.h"
+#include "ninfer/ops/readout_logprobs.h"
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/kv_cache_append.h"
 #include "ninfer/ops/speculative_round.h"
@@ -41,6 +42,7 @@
 #include "ninfer/ops/silu_mul.h"
 #include "ninfer/ops/softmax_attention.h"
 
+#include <optional>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -604,7 +606,9 @@ void TextContext::proposal_argmax(const Tensor& hidden, Tensor& logits, Tensor& 
     nvtx::ScopedRange proposal_range(nvtx::Name::MtpProposal, nvtx::Category::Mtp,
                                      static_cast<std::uint64_t>(T));
     if (proposal_head_ != nullptr) {
-        Tensor proposal_logits = work_.alloc(DType::BF16, {proposal_head_n_, T});
+        Tensor proposal_logits =
+            work_.alloc(fp32_proposal_logits(*proposal_head_) ? DType::FP32 : DType::BF16,
+                        {proposal_head_n_, T});
         project(hidden, *proposal_head_, proposal_logits, work_, ctx_.stream);
         ops::argmax(proposal_logits, proposal_tokens,
                     proposal_head_ids_
@@ -616,7 +620,9 @@ void TextContext::proposal_argmax(const Tensor& hidden, Tensor& logits, Tensor& 
                                           ctx_.stream);
         }
     } else {
-        Tensor output_logits = matrix_window(logits, T);
+        Tensor output_logits = fp32_proposal_logits(mtp_->output_head)
+                                   ? work_.alloc(DType::FP32, {dimension(config_.vocab_size), T})
+                                   : matrix_window(logits, T);
         project(hidden, mtp_->output_head, output_logits, work_, ctx_.stream);
         ops::argmax(output_logits, proposal_tokens,
                     dimension(parameters_.model.resources().public_token_count), ctx_.stream);
@@ -874,11 +880,34 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
     const auto& p  = std::get<AttentionParameters>(w.mixer);
     cudaStream_t s = ctx_.stream;
     const int T    = x.ne[1];
+    // A tensor-parallel rank runs its KV heads and the query heads that read them, over its own
+    // planes of the layer's KV cache.
+    const TextConfig& config = layer_config();
+    const std::size_t kv_rank =
+        stage_runtime_ != nullptr && stage_runtime_->tensor_parallel ? tensor_rank_ : 0;
     if (active_causal_attention_envelope_ == nullptr) {
         throw std::logic_error("Text GQA execution envelope is not set");
     }
+    // The text cache's split schedule: fixed key segments under invariant reductions.
+    const auto with_segments = [&](ops::CausalAttentionExecutionEnvelope envelope) {
+        envelope.invariant_segment_keys = batch_text_kv_->attention_segment_keys();
+        return envelope;
+    };
+    const ops::CausalAttentionExecutionEnvelope envelope =
+        with_segments(*active_causal_attention_envelope_);
+    // A position-split rank attends over its own pages into its partial output and keeps its query
+    // heads' gates; attn_merge_output merges and projects once every rank's partial is out.
+    const bool positions = attention_partial_ != nullptr;
+    const auto query_heads = static_cast<std::int32_t>(config.attention->num_attention_heads);
+    const auto partial_of  = [&](std::int32_t column, std::int32_t columns) {
+        return Tensor(attention_partial_ + static_cast<std::size_t>(column) *
+                                               ops::causal_attention_partial_elements(query_heads, 1),
+                      DType::FP32,
+                      {static_cast<std::int32_t>(
+                          ops::causal_attention_partial_elements(query_heads, columns))});
+    };
 
-    const auto projection        = workspace::text_attention_projection(work_, config_, T);
+    const auto projection        = workspace::text_attention_projection(work_, config, T);
     const Tensor& input_signs    = projection_signs(p.projection);
     const InputBasis input_basis = rotated(input_signs) ? InputBasis::Rotated : InputBasis::Primal;
     // The NVFP4 W4A4 route can normalize while it quantizes, which skips the BF16 round trip of
@@ -897,18 +926,18 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
         ops::rmsnorm(x, w.input_norm, config_.rms_norm_eps, true, h, s);
     }
 
-    Tensor q         = projection.query.view({dimension(config_.attention->head_dim),
-                                              dimension(config_.attention->num_attention_heads), T});
-    Tensor gate      = projection.gate.view({dimension(config_.attention->head_dim),
-                                             dimension(config_.attention->num_attention_heads), T});
-    Tensor k         = projection.key.view({dimension(config_.attention->head_dim),
-                                            dimension(config_.attention->num_key_value_heads), T});
-    Tensor v         = projection.value.view({dimension(config_.attention->head_dim),
-                                              dimension(config_.attention->num_key_value_heads), T});
-    Tensor q_flat    = q.view({dimension(config_.attention->query_width()), T});
-    Tensor gate_flat = gate.view({dimension(config_.attention->query_width()), T});
-    Tensor k_flat    = k.view({dimension(config_.attention->key_width()), T});
-    Tensor v_flat    = v.view({dimension(config_.attention->key_width()), T});
+    Tensor q         = projection.query.view({dimension(config.attention->head_dim),
+                                              dimension(config.attention->num_attention_heads), T});
+    Tensor gate      = projection.gate.view({dimension(config.attention->head_dim),
+                                             dimension(config.attention->num_attention_heads), T});
+    Tensor k         = projection.key.view({dimension(config.attention->head_dim),
+                                            dimension(config.attention->num_key_value_heads), T});
+    Tensor v         = projection.value.view({dimension(config.attention->head_dim),
+                                              dimension(config.attention->num_key_value_heads), T});
+    Tensor q_flat    = q.view({dimension(config.attention->query_width()), T});
+    Tensor gate_flat = gate.view({dimension(config.attention->query_width()), T});
+    Tensor k_flat    = k.view({dimension(config.attention->key_width()), T});
+    Tensor v_flat    = v.view({dimension(config.attention->key_width()), T});
     if (fused_nvfp4) {
         ops::attn_input_proj_fused_rmsnorm_nvfp4(x, w.input_norm, config_.rms_norm_eps,
                                                  single->weight, q_flat, gate_flat, k_flat, v_flat,
@@ -917,23 +946,22 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
         attention_projection(h, p, q_flat, gate_flat, k_flat, v_flat, work_, s, input_basis);
     }
 
-    const auto results = workspace::text_attention_results(work_, config_, T);
+    const auto results = workspace::text_attention_results(work_, config, T);
     Tensor qn =
-        results.normalized_query.view({dimension(config_.attention->head_dim),
-                                       dimension(config_.attention->num_attention_heads), T});
-    Tensor kn = results.normalized_key.view({dimension(config_.attention->head_dim),
-                                             dimension(config_.attention->num_key_value_heads), T});
+        results.normalized_query.view({dimension(config.attention->head_dim),
+                                       dimension(config.attention->num_attention_heads), T});
+    Tensor kn = results.normalized_key.view({dimension(config.attention->head_dim),
+                                             dimension(config.attention->num_key_value_heads), T});
     const Tensor& cache_positions =
         active_cache_positions_ != nullptr ? *active_cache_positions_ : io_.pos;
     const Tensor& rope_positions =
         active_rope_positions_ != nullptr ? *active_rope_positions_ : io_.rope_pos;
     Tensor rope_for_op = active_sequence_batch_ != 0 ? rope_positions.view({T}) : rope_positions;
-    text_qk_norm_rope(rope_for_op, *config_.rope_parameters, *config_.attention,
-                      config_.rms_norm_eps, p.query_norm, p.key_norm, q, k, qn, kn, rope_yarn_,
-                      s);
+    text_qk_norm_rope(rope_for_op, *config_.rope_parameters, *config.attention,
+                      config_.rms_norm_eps, p.query_norm, p.key_norm, q, k, qn, kn, rope_yarn_, s);
 
-    Tensor a = results.attention.view({dimension(config_.attention->head_dim),
-                                       dimension(config_.attention->num_attention_heads), T});
+    Tensor a = results.attention.view({dimension(config.attention->head_dim),
+                                       dimension(config.attention->num_attention_heads), T});
     const bool rotated_output = rotated(p.output.hadamard_signs);
     const Tensor& kv_table_rows =
         active_kv_table_rows_ != nullptr ? *active_kv_table_rows_ : io_.text_kv_table_row;
@@ -942,20 +970,20 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
         if (width <= 0 || width * active_sequence_batch_ != T) {
             throw std::logic_error("Text sequence batch binding does not match aggregate columns");
         }
-        Tensor q_batch        = qn.view({dimension(config_.attention->head_dim),
-                                         dimension(config_.attention->num_attention_heads), width,
+        Tensor q_batch        = qn.view({dimension(config.attention->head_dim),
+                                         dimension(config.attention->num_attention_heads), width,
                                          active_sequence_batch_});
-        Tensor k_batch        = kn.view({dimension(config_.attention->head_dim),
-                                         dimension(config_.attention->num_key_value_heads), width,
+        Tensor k_batch        = kn.view({dimension(config.attention->head_dim),
+                                         dimension(config.attention->num_key_value_heads), width,
                                          active_sequence_batch_});
-        Tensor v_batch        = v.view({dimension(config_.attention->head_dim),
-                                        dimension(config_.attention->num_key_value_heads), width,
+        Tensor v_batch        = v.view({dimension(config.attention->head_dim),
+                                        dimension(config.attention->num_key_value_heads), width,
                                         active_sequence_batch_});
-        Tensor a_batch        = a.view({dimension(config_.attention->head_dim),
-                                        dimension(config_.attention->num_attention_heads), width,
+        Tensor a_batch        = a.view({dimension(config.attention->head_dim),
+                                        dimension(config.attention->num_attention_heads), width,
                                         active_sequence_batch_});
-        Tensor gate_batch     = gate.view({dimension(config_.attention->head_dim),
-                                           dimension(config_.attention->num_attention_heads), width,
+        Tensor gate_batch     = gate.view({dimension(config.attention->head_dim),
+                                           dimension(config.attention->num_attention_heads), width,
                                            active_sequence_batch_});
         Tensor position_batch = cache_positions.view({width, active_sequence_batch_});
         const Tensor valid = active_valid_columns_ != nullptr ? *active_valid_columns_ : Tensor{};
@@ -963,49 +991,144 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
         // applies it at the store, and every other route applies it inside the Op. One contract
         // either way, and the same bytes the standalone multiply produced. A rotated output
         // projection takes the ungated attention, gated and rotated in one pass below.
+        Tensor partial = positions ? partial_of(0, T) : Tensor{};
         ops::causal_softmax_attention(
             q_batch, k_batch, v_batch, position_batch, valid, kv_table_rows,
-            {dimension(config_.attention->head_dim),
-             dimension(config_.attention->num_attention_heads),
-             dimension(config_.attention->num_key_value_heads)},
-            static_cast<float>(1.0 / std::sqrt(static_cast<double>(config_.attention->head_dim))),
-            batch_text_kv_->batch_layer_view(fidx), *active_causal_attention_envelope_, work_,
-            a_batch, s, rotated_output ? nullptr : &gate_batch);
+            {dimension(config.attention->head_dim),
+             dimension(config.attention->num_attention_heads),
+             dimension(config.attention->num_key_value_heads)},
+            static_cast<float>(1.0 / std::sqrt(static_cast<double>(config.attention->head_dim))),
+            batch_text_kv_->batch_layer_view(fidx, kv_rank), envelope, work_, a_batch, s,
+            rotated_output || positions ? nullptr : &gate_batch, positions ? &partial : nullptr);
+    } else if (!active_segments_.empty()) {
+        // Each segment attends over its own sequence exactly as its prefill alone would.
+        for (const SegmentBinding& segment : active_segments_) {
+            auto scope           = work_.scope();
+            Tensor a_segment     = a.slice(2, segment.column, segment.columns);
+            Tensor gate_segment  = gate.slice(2, segment.column, segment.columns);
+            Tensor partial = positions ? partial_of(segment.column, segment.columns) : Tensor{};
+            ops::causal_softmax_attention(
+                qn.slice(2, segment.column, segment.columns),
+                kn.slice(2, segment.column, segment.columns),
+                v.slice(2, segment.column, segment.columns), segment.positions, Tensor{},
+                segment.kv_table_row,
+                {dimension(config.attention->head_dim),
+                 dimension(config.attention->num_attention_heads),
+                 dimension(config.attention->num_key_value_heads)},
+                static_cast<float>(1.0 /
+                                   std::sqrt(static_cast<double>(config.attention->head_dim))),
+                batch_text_kv_->batch_layer_view(fidx, kv_rank), with_segments(segment.envelope),
+                work_, a_segment, s, rotated_output || positions ? nullptr : &gate_segment,
+                positions ? &partial : nullptr);
+        }
     } else {
+        Tensor partial = positions ? partial_of(0, T) : Tensor{};
         ops::causal_softmax_attention(
             qn, kn, v, cache_positions, Tensor{}, kv_table_rows,
-            {dimension(config_.attention->head_dim),
-             dimension(config_.attention->num_attention_heads),
-             dimension(config_.attention->num_key_value_heads)},
-            static_cast<float>(1.0 / std::sqrt(static_cast<double>(config_.attention->head_dim))),
-            batch_text_kv_->batch_layer_view(fidx), *active_causal_attention_envelope_, work_, a, s,
-            rotated_output ? nullptr : &gate);
+            {dimension(config.attention->head_dim),
+             dimension(config.attention->num_attention_heads),
+             dimension(config.attention->num_key_value_heads)},
+            static_cast<float>(1.0 / std::sqrt(static_cast<double>(config.attention->head_dim))),
+            batch_text_kv_->batch_layer_view(fidx, kv_rank), envelope, work_, a, s,
+            rotated_output || positions ? nullptr : &gate, positions ? &partial : nullptr);
     }
-    const bool wide = wide_residual_verification(ph, row_width(T), row_width(T));
-    Tensor gated    = a.view({dimension(config_.attention->query_width()), T});
-    if (rotated_output) {
-        ops::sigmoid_mul_hadamard(gate, a, p.output.hadamard_signs, gated, s);
-        project_add(gated, p.output, x, work_, s, InputBasis::Rotated, wide);
+    if (positions) {
+        // The rank's query heads' gates, contiguous for the merge.
+        const TensorShare& share = stage_runtime_->tensor_parallel->shares[tensor_rank_];
+        const std::size_t row =
+            static_cast<std::size_t>(config.attention->head_dim) * sizeof(__nv_bfloat16);
+        const std::size_t heads = share.query_head_end - share.query_head_begin;
+        CUDA_CHECK(cudaMemcpy2DAsync(attention_gate_->data, heads * row,
+                                     static_cast<const std::byte*>(gate.data) +
+                                         share.query_head_begin * row,
+                                     static_cast<std::size_t>(query_heads) * row, heads * row,
+                                     static_cast<std::size_t>(T), cudaMemcpyDeviceToDevice, s));
         return;
     }
-    project_add(gated, p.output, x, work_, s, InputBasis::Primal, wide);
+    const bool wide = wide_residual_verification(ph, row_width(T), row_width(T));
+    Tensor gated    = a.view({dimension(config.attention->query_width()), T});
+    if (rotated_output) {
+        ops::sigmoid_mul_hadamard(gate, a, p.output.hadamard_signs, gated, s);
+        project_residual(gated, p.output, x, InputBasis::Rotated, wide);
+        return;
+    }
+    project_residual(gated, p.output, x, InputBasis::Primal, wide);
+}
+
+void TextContext::attn_merge_output(const BlockParameters& w, Tensor& x,
+                                    std::span<const float* const> partials, const Tensor& gate,
+                                    Phase ph) {
+    const auto& p            = std::get<AttentionParameters>(w.mixer);
+    const TextConfig& config = layer_config();
+    const TensorShare& share = stage_runtime_->tensor_parallel->shares[tensor_rank_];
+    const int T              = x.ne[1];
+    const auto heads = static_cast<std::int32_t>(share.query_head_end - share.query_head_begin);
+    const auto head_dim      = dimension(config.attention->head_dim);
+    Tensor a = workspace::matrix(work_, DType::BF16, head_dim * heads, T).view({head_dim, heads, T});
+    Tensor gated = a.view({head_dim * heads, T});
+    const bool wide = wide_residual_verification(ph, row_width(T), row_width(T));
+    if (rotated(p.output.hadamard_signs)) {
+        // As attn_mix: the ungated output, gated and rotated in one pass.
+        ops::causal_attention_merge_partials(
+            partials, static_cast<std::int32_t>(config.attention->num_attention_heads), T,
+            static_cast<std::int32_t>(share.query_head_begin), nullptr, a, ctx_.stream);
+        ops::sigmoid_mul_hadamard(gate, a, p.output.hadamard_signs, gated, ctx_.stream);
+        project_residual(gated, p.output, x, InputBasis::Rotated, wide);
+        return;
+    }
+    ops::causal_attention_merge_partials(
+        partials, static_cast<std::int32_t>(config.attention->num_attention_heads), T,
+        static_cast<std::int32_t>(share.query_head_begin), &gate, a, ctx_.stream);
+    project_residual(gated, p.output, x, InputBasis::Primal, wide);
+}
+
+void TextContext::project_residual(const Tensor& input, const LinearParameters& p, Tensor& x,
+                                   InputBasis basis, bool wide_verification) {
+    if (residual_partial_ == nullptr) {
+        project_add(input, p, x, work_, ctx_.stream, basis, wide_verification);
+        return;
+    }
+    auto scope     = work_.scope();
+    const Tensor v = rotated_input(input, p.hadamard_signs, work_, ctx_.stream, basis);
+    ops::linear(v, p.weight, *residual_partial_, residual_projection_policy(p, wide_verification),
+                work_, ctx_.stream);
 }
 
 void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase ph) {
-    const auto& p  = std::get<GdnParameters>(w.mixer);
-    cudaStream_t s = ctx_.stream;
-    const int T    = x.ne[1];
+    const auto& p                = std::get<GdnParameters>(w.mixer);
+    cudaStream_t s               = ctx_.stream;
+    const int T                  = x.ne[1];
+    const TextConfig& config     = layer_config();
 
+    // A tensor-parallel rank gates every head, as one device would, and keeps its own.
     const auto control = workspace::gdn_control(work_, config_, T);
     Tensor h           = control.hidden;
     Tensor g           = control.g;
     Tensor beta        = control.beta;
-    const InputBasis projection_basis = gdn_norm_control(x, w.input_norm, config_.rms_norm_eps, p,
+    const InputBasis projection_basis = gdn_norm_control(x, w.input_norm, config.rms_norm_eps, p,
                                                          h, g, beta, work_, ctx_.execution_view());
+    if (&config != &config_) {
+        const auto heads     = static_cast<std::size_t>(config.gdn->linear_num_value_heads);
+        const auto all_heads = static_cast<std::size_t>(config_.gdn->linear_num_value_heads);
+        // The rank's value heads follow its first key head's.
+        const auto first = static_cast<std::size_t>(
+                               stage_runtime_->tensor_parallel->shares[tensor_rank_].key_head_begin) *
+                           (all_heads / config_.gdn->linear_num_key_heads);
+        const auto own_gates = [&](const Tensor& all) {
+            Tensor own = work_.alloc(DType::FP32, {static_cast<std::int32_t>(heads), T});
+            CUDA_CHECK(cudaMemcpy2DAsync(own.data, heads * sizeof(float),
+                                         static_cast<const float*>(all.data) + first,
+                                         all_heads * sizeof(float), heads * sizeof(float),
+                                         static_cast<std::size_t>(T), cudaMemcpyDeviceToDevice, s));
+            return own;
+        };
+        g    = own_gates(g);
+        beta = own_gates(beta);
+    }
 
-    const auto projection = workspace::gdn_projection(work_, config_, T);
-    Tensor z  = projection.output_gate.view({dimension(config_.gdn->linear_value_head_dim),
-                                             dimension(config_.gdn->linear_num_value_heads), T});
+    const auto projection = workspace::gdn_projection(work_, config, T);
+    Tensor z  = projection.output_gate.view({dimension(config.gdn->linear_value_head_dim),
+                                             dimension(config.gdn->linear_num_value_heads), T});
     Tensor qc = projection.query;
     Tensor kc = projection.key;
     Tensor vc = projection.value;
@@ -1022,15 +1145,15 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
             throw std::logic_error("In-place batched GDN update requires width one");
         }
         Tensor projection_input =
-            h.view({dimension(config_.hidden_size), width, active_sequence_batch_});
+            h.view({dimension(config.hidden_size), width, active_sequence_batch_});
         Tensor query_output =
-            qc.view({dimension(config_.gdn->key_width()), width, active_sequence_batch_});
+            qc.view({dimension(config.gdn->key_width()), width, active_sequence_batch_});
         Tensor key_output =
-            kc.view({dimension(config_.gdn->key_width()), width, active_sequence_batch_});
+            kc.view({dimension(config.gdn->key_width()), width, active_sequence_batch_});
         Tensor value_output =
-            vc.view({dimension(config_.gdn->value_width()), width, active_sequence_batch_});
+            vc.view({dimension(config.gdn->value_width()), width, active_sequence_batch_});
         Tensor gate_output =
-            z.view({dimension(config_.gdn->value_width()), width, active_sequence_batch_});
+            z.view({dimension(config.gdn->value_width()), width, active_sequence_batch_});
         const GdnStateRef gdn_pool = gdn_state(static_cast<std::uint32_t>(gidx));
         Tensor conv_states         = gdn_pool.pool->layer_view(gdn_pool.local).conv;
         const Tensor valid = active_valid_columns_ != nullptr ? *active_valid_columns_ : Tensor{};
@@ -1040,58 +1163,79 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
             }
             GdnReplayRecordLayer records =
                 replay_layer(static_cast<std::uint32_t>(gidx), active_sequence_batch_, width);
-            gdn_projection_record(projection_input, p, *config_.gdn, conv_states, valid,
+            gdn_projection_record(projection_input, p, *config.gdn, conv_states, valid,
                                   *active_linear_state_source_slots_, records.conv, query_output,
                                   key_output, value_output, gate_output, work_, s,
                                   projection_basis);
         } else {
             gdn_projection_snapshot(
-                projection_input, p, *config_.gdn, conv_states, valid,
+                projection_input, p, *config.gdn, conv_states, valid,
                 *active_linear_state_source_slots_, *active_linear_state_destination_slots_,
                 query_output, key_output, value_output, gate_output, work_, s, projection_basis);
         }
     } else {
-        Tensor qkv    = workspace::gdn_prefill_conv(work_, config_, T);
-        Tensor z_flat = z.view({dimension(config_.gdn->value_width()), T});
+        Tensor qkv    = workspace::gdn_prefill_conv(work_, config, T);
+        Tensor z_flat = z.view({dimension(config.gdn->value_width()), T});
         gdn_projection(h, p, qkv, z_flat, work_, s, projection_basis);
         const GdnStateRef gdn_pool = gdn_state(static_cast<std::uint32_t>(gidx));
-        Tensor conv_state_in       = gdn_pool.pool->conv_slot(gdn_pool.local, linear_state_source_slot_);
-        Tensor conv_state_out =
-            gdn_pool.pool->conv_slot(gdn_pool.local, linear_state_destination_slot_);
-        ops::causal_conv1d_silu_split(qkv, p.convolution, conv_state_in, conv_state_out, qc, kc, vc,
-                                      s);
+        if (!active_segments_.empty()) {
+            for (const SegmentBinding& segment : active_segments_) {
+                auto scope = work_.scope();
+                const Tensor conv_state_in =
+                    gdn_pool.pool->conv_slot(gdn_pool.local, segment.state_source_slot);
+                // A branch block keeps no state: its convolution window goes to scratch.
+                Tensor conv_state_out =
+                    segment.state_destination_slot >= 0
+                        ? gdn_pool.pool->conv_slot(gdn_pool.local, segment.state_destination_slot)
+                        : work_.alloc(conv_state_in.dtype,
+                                      {conv_state_in.ne[0], conv_state_in.ne[1]});
+                Tensor q_segment = qc.slice(1, segment.column, segment.columns);
+                Tensor k_segment = kc.slice(1, segment.column, segment.columns);
+                Tensor v_segment = vc.slice(1, segment.column, segment.columns);
+                ops::causal_conv1d_silu_split(qkv.slice(1, segment.column, segment.columns),
+                                              p.convolution, conv_state_in, conv_state_out,
+                                              q_segment, k_segment, v_segment, s);
+            }
+        } else {
+            Tensor conv_state_in =
+                gdn_pool.pool->conv_slot(gdn_pool.local, linear_state_source_slot_);
+            Tensor conv_state_out =
+                gdn_pool.pool->conv_slot(gdn_pool.local, linear_state_destination_slot_);
+            ops::causal_conv1d_silu_split(qkv, p.convolution, conv_state_in, conv_state_out, qc,
+                                          kc, vc, s);
+        }
     }
 
-    Tensor q_recurrent = qc.view({dimension(config_.gdn->linear_key_head_dim),
-                                  dimension(config_.gdn->linear_num_key_heads), T});
-    Tensor k_recurrent = kc.view({dimension(config_.gdn->linear_key_head_dim),
-                                  dimension(config_.gdn->linear_num_key_heads), T});
+    Tensor q_recurrent = qc.view({dimension(config.gdn->linear_key_head_dim),
+                                  dimension(config.gdn->linear_num_key_heads), T});
+    Tensor k_recurrent = kc.view({dimension(config.gdn->linear_key_head_dim),
+                                  dimension(config.gdn->linear_num_key_heads), T});
 
-    Tensor vv = vc.view({dimension(config_.gdn->linear_value_head_dim),
-                         dimension(config_.gdn->linear_num_value_heads), T});
-    Tensor o  = workspace::gdn_recurrent_output(work_, config_, T)
-                   .view({dimension(config_.gdn->linear_value_head_dim),
-                          dimension(config_.gdn->linear_num_value_heads), T});
+    Tensor vv = vc.view({dimension(config.gdn->linear_value_head_dim),
+                         dimension(config.gdn->linear_num_value_heads), T});
+    Tensor o  = workspace::gdn_recurrent_output(work_, config, T)
+                   .view({dimension(config.gdn->linear_value_head_dim),
+                          dimension(config.gdn->linear_num_value_heads), T});
     if (ph == Phase::Verify) {
         const GdnStateRef recurrent_pool = gdn_state(static_cast<std::uint32_t>(gidx));
         Tensor recurrent_states  = recurrent_pool.pool->layer_view(recurrent_pool.local).recurrent;
         const std::int32_t width = active_sequence_width_;
-        Tensor q_batch           = q_recurrent.view({dimension(config_.gdn->linear_key_head_dim),
-                                                     dimension(config_.gdn->linear_num_key_heads), width,
+        Tensor q_batch           = q_recurrent.view({dimension(config.gdn->linear_key_head_dim),
+                                                     dimension(config.gdn->linear_num_key_heads), width,
                                                      active_sequence_batch_});
-        Tensor k_batch           = k_recurrent.view({dimension(config_.gdn->linear_key_head_dim),
-                                                     dimension(config_.gdn->linear_num_key_heads), width,
+        Tensor k_batch           = k_recurrent.view({dimension(config.gdn->linear_key_head_dim),
+                                                     dimension(config.gdn->linear_num_key_heads), width,
                                                      active_sequence_batch_});
-        Tensor v_batch           = vv.view({dimension(config_.gdn->linear_value_head_dim),
-                                            dimension(config_.gdn->linear_num_value_heads), width,
+        Tensor v_batch           = vv.view({dimension(config.gdn->linear_value_head_dim),
+                                            dimension(config.gdn->linear_num_value_heads), width,
                                             active_sequence_batch_});
         Tensor g_batch =
-            g.view({dimension(config_.gdn->linear_num_value_heads), width, active_sequence_batch_});
+            g.view({dimension(config.gdn->linear_num_value_heads), width, active_sequence_batch_});
         Tensor beta_batch = beta.view(
-            {dimension(config_.gdn->linear_num_value_heads), width, active_sequence_batch_});
+            {dimension(config.gdn->linear_num_value_heads), width, active_sequence_batch_});
         Tensor out_batch =
-            o.view({dimension(config_.gdn->linear_value_head_dim),
-                    dimension(config_.gdn->linear_num_value_heads), width, active_sequence_batch_});
+            o.view({dimension(config.gdn->linear_value_head_dim),
+                    dimension(config.gdn->linear_num_value_heads), width, active_sequence_batch_});
         const Tensor valid = active_valid_columns_ != nullptr ? *active_valid_columns_ : Tensor{};
         if (gdn_state_action_ == GdnStateAction::RecordForReplay) {
             GdnReplayRecordLayer records =
@@ -1099,16 +1243,42 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
             ops::gated_delta_net_replay_record(
                 q_batch, k_batch, v_batch, g_batch, beta_batch,
                 static_cast<float>(
-                    1.0 / std::sqrt(static_cast<double>(config_.gdn->linear_key_head_dim))),
+                    1.0 / std::sqrt(static_cast<double>(config.gdn->linear_key_head_dim))),
                 recurrent_states, valid, *active_linear_state_source_slots_, records.key,
                 records.value, records.gate, out_batch, s);
         } else {
             ops::gated_delta_net_batch_update(
                 q_batch, k_batch, v_batch, g_batch, beta_batch,
                 static_cast<float>(
-                    1.0 / std::sqrt(static_cast<double>(config_.gdn->linear_key_head_dim))),
+                    1.0 / std::sqrt(static_cast<double>(config.gdn->linear_key_head_dim))),
                 /*normalize_qk=*/true, recurrent_states, *active_linear_state_source_slots_,
                 *active_linear_state_destination_slots_, out_batch, s);
+        }
+    } else if (!active_segments_.empty()) {
+        const GdnStateRef recurrent_pool = gdn_state(static_cast<std::uint32_t>(gidx));
+        for (const SegmentBinding& segment : active_segments_) {
+            auto scope = work_.scope();
+            const Tensor recurrent_state_in =
+                recurrent_pool.pool->recurrent_slot(recurrent_pool.local, segment.state_source_slot);
+            // A branch block starts from the state its read's prompt left and keeps nothing.
+            Tensor recurrent_state_out =
+                segment.state_destination_slot >= 0
+                    ? recurrent_pool.pool->recurrent_slot(recurrent_pool.local,
+                                                          segment.state_destination_slot)
+                    : work_.alloc(recurrent_state_in.dtype,
+                                  {recurrent_state_in.ne[0], recurrent_state_in.ne[1],
+                                   recurrent_state_in.ne[2]});
+            Tensor o_segment = o.slice(2, segment.column, segment.columns);
+            ops::gated_delta_net(
+                q_recurrent.slice(2, segment.column, segment.columns),
+                k_recurrent.slice(2, segment.column, segment.columns),
+                vv.slice(2, segment.column, segment.columns),
+                g.slice(1, segment.column, segment.columns),
+                beta.slice(1, segment.column, segment.columns),
+                static_cast<float>(
+                    1.0 / std::sqrt(static_cast<double>(config.gdn->linear_key_head_dim))),
+                /*normalize_qk=*/true, work_, recurrent_state_in, recurrent_state_out, o_segment,
+                s);
         }
     } else {
         const GdnStateRef recurrent_pool = gdn_state(static_cast<std::uint32_t>(gidx));
@@ -1119,23 +1289,23 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
         ops::gated_delta_net(
             q_recurrent, k_recurrent, vv, g, beta,
             static_cast<float>(1.0 /
-                               std::sqrt(static_cast<double>(config_.gdn->linear_key_head_dim))),
+                               std::sqrt(static_cast<double>(config.gdn->linear_key_head_dim))),
             /*normalize_qk=*/true, work_, recurrent_state_in, recurrent_state_out, o, s);
     }
 
-    Tensor on = workspace::gdn_normalized_output(work_, config_, T)
-                    .view({dimension(config_.gdn->linear_value_head_dim),
-                           dimension(config_.gdn->linear_num_value_heads), T});
-    Tensor normalized = on.view({dimension(config_.gdn->value_width()), T});
+    Tensor on = workspace::gdn_normalized_output(work_, config, T)
+                    .view({dimension(config.gdn->linear_value_head_dim),
+                           dimension(config.gdn->linear_num_value_heads), T});
+    Tensor normalized = on.view({dimension(config.gdn->value_width()), T});
     if (rotated(p.output.hadamard_signs)) {
-        ops::gated_rmsnorm_hadamard(o, p.norm, z, config_.rms_norm_eps, p.output.hadamard_signs,
+        ops::gated_rmsnorm_hadamard(o, p.norm, z, config.rms_norm_eps, p.output.hadamard_signs,
                                     normalized, s);
-        project_add(normalized, p.output, x, work_, s, InputBasis::Rotated);
+        project_residual(normalized, p.output, x, InputBasis::Rotated, false);
         return;
     }
-    ops::gated_rmsnorm(o, p.norm, z, ops::GateActivation::Silu, config_.rms_norm_eps, on, s);
-    project_add(normalized, p.output, x, work_, s, InputBasis::Primal,
-                wide_residual_verification(ph, row_width(T), row_width(T)));
+    ops::gated_rmsnorm(o, p.norm, z, ops::GateActivation::Silu, config.rms_norm_eps, on, s);
+    project_residual(normalized, p.output, x, InputBasis::Primal,
+                     wide_residual_verification(ph, row_width(T), row_width(T)));
 }
 
 ops::SparseMoeHints TextContext::next_projection_hints(int layer) const {
@@ -1146,22 +1316,26 @@ ops::SparseMoeHints TextContext::next_projection_hints(int layer) const {
 
 void TextContext::mlp_tail(const BlockParameters& weights, Tensor& x, Phase phase,
                            const ops::SparseMoeHints& hints) {
-    Tensor h = workspace::post_mixer_hidden(work_, config_, x.ne[1]);
+    const TextConfig& config = layer_config();
+    Tensor h                 = workspace::post_mixer_hidden(work_, config, x.ne[1]);
     if (const Tensor* signs = ffn_input_signs(weights.ffn)) {
-        ops::rmsnorm_hadamard(x, weights.post_attention_norm, config_.rms_norm_eps, true, *signs, h,
+        ops::rmsnorm_hadamard(x, weights.post_attention_norm, config.rms_norm_eps, true, *signs, h,
                               ctx_.stream);
         ffn(h, weights.ffn, x, hints, work_, ctx_.stream, false, phase == Phase::Verify,
-            InputBasis::Rotated, false, experts_);
+            InputBasis::Rotated, false, experts_, residual_partial_);
         return;
     }
-    ops::rmsnorm(x, weights.post_attention_norm, config_.rms_norm_eps, true, h, ctx_.stream);
+    ops::rmsnorm(x, weights.post_attention_norm, config.rms_norm_eps, true, h, ctx_.stream);
     ffn(h, weights.ffn, x, hints, work_, ctx_.stream, false, phase == Phase::Verify,
         InputBasis::Primal,
-        wide_residual_verification(phase, row_width(x.ne[1]), row_width(x.ne[1])), experts_);
+        wide_residual_verification(phase, row_width(x.ne[1]), row_width(x.ne[1])), experts_,
+        residual_partial_);
 }
 
 TextContext::GdnShard TextContext::gdn_shard(std::uint32_t layer) const {
     if (stage_runtime_ == nullptr) { return {0, layer}; }
+    // Every rank holds its share of every layer.
+    if (stage_runtime_->tensor_parallel) { return {tensor_rank_, layer}; }
     // The shard holding a layer is the last one that starts at or before it.
     for (std::size_t shard = stage_runtime_->state.size(); shard-- > 0;) {
         if (stage_runtime_->state_first_layer[shard] <= layer) {
@@ -1439,6 +1613,250 @@ void TextContext::run_staged(Tensor& x, Phase ph, Tap& tap) {
     runtime.back->recv(x.data, x.bytes(), slot, entry_stream);
 }
 
+// Runs every layer with each rank issuing its share of it. Rank 0 sends the residual and the
+// control tensors to the other ranks once, and each holds a replica of the residual from then on.
+// A GDN mixer or an FFN is one exchange: every rank projects its share into an FP32 partial and
+// every replica adds the sum of the partials. Attention is the same exchange over the ranks that
+// hold KV heads, each attending with its own heads. The replicas stay equal, and rank 0's ends the
+// pass where one device's would.
+template <class Tap>
+void TextContext::run_tensor_parallel(Tensor& x, Phase ph, Tap& tap) {
+    StageRuntime& runtime            = *stage_runtime_;
+    auto& tp                         = *runtime.tensor_parallel;
+    TensorParallelExchange& exchange = *tp.exchange;
+    const std::size_t ranks          = exchange.ranks();
+    if (runtime.forward.size() + 1 != ranks || runtime.control.size() + 1 != ranks ||
+        tp.joined.size() + 1 != ranks || parameters_.text.rank_layers.size() + 1 != ranks ||
+        ctx_.active_rank() != 0) {
+        throw std::logic_error("tensor-parallel runtime does not match the model's ranks");
+    }
+    const std::uint32_t slot = runtime.next_slot;
+    runtime.next_slot = (slot + 1U) % static_cast<std::uint32_t>(runtime.forward.front().slots());
+
+    // The control tensors, packed as for pipeline stages.
+    const std::array<const Tensor**, kControlTensors> slots = {
+        &active_cache_positions_,           &active_rope_positions_,
+        &active_kv_table_rows_,             &active_valid_columns_,
+        &active_linear_state_source_slots_, &active_linear_state_destination_slots_};
+    const std::array<const Tensor*, kControlTensors> fallback = {
+        &io_.pos, &io_.rope_pos, &io_.text_kv_table_row, nullptr, nullptr, nullptr};
+    std::array<const Tensor*, kControlTensors> current{};
+    std::array<const Tensor*, kControlTensors> sources{};
+    std::array<std::int64_t, kControlTensors> offset{};
+    std::int64_t total = 0;
+    for (std::size_t i = 0; i < kControlTensors; ++i) {
+        current[i] = *slots[i];
+        sources[i] = *slots[i] != nullptr ? *slots[i] : fallback[i];
+        if (sources[i] == nullptr || sources[i]->data == nullptr) {
+            offset[i] = -1;
+            continue;
+        }
+        if (sources[i]->dtype != DType::I32 || !sources[i]->is_contiguous()) {
+            throw std::logic_error("a tensor-parallel control tensor is not contiguous int32");
+        }
+        offset[i] = total;
+        total += sources[i]->numel();
+    }
+    total                           = std::max<std::int64_t>((total + 3) & ~std::int64_t{3}, 4);
+    const std::size_t control_bytes = static_cast<std::size_t>(total) * sizeof(std::int32_t);
+    const std::int64_t values = static_cast<std::int64_t>(x.ne[0]) * x.ne[1];
+    const std::size_t partial_bytes = static_cast<std::size_t>(values) * sizeof(float);
+    if (control_bytes > runtime.control.front().slot_bytes() ||
+        x.bytes() > runtime.forward.front().slot_bytes() || partial_bytes > exchange.slot_bytes()) {
+        throw std::runtime_error("a tensor-parallel pass exceeds its links");
+    }
+
+    const cudaStream_t entry_stream = ctx_.stream_for_rank(0);
+    auto entry_scope                = work_.scope();
+    Tensor pack = work_.alloc(DType::I32, {static_cast<std::int32_t>(total)});
+    for (std::size_t i = 0; i < kControlTensors; ++i) {
+        if (offset[i] < 0) { continue; }
+        CUDA_CHECK(cudaMemcpyAsync(static_cast<std::int32_t*>(pack.data) + offset[i],
+                                   sources[i]->data, sources[i]->bytes(),
+                                   cudaMemcpyDeviceToDevice, entry_stream));
+    }
+    for (std::size_t rank = 1; rank < ranks; ++rank) {
+        runtime.control[rank - 1].send(pack.data, control_bytes, slot, entry_stream);
+        runtime.forward[rank - 1].send(x.data, x.bytes(), slot, entry_stream);
+    }
+
+    // Each rank's replica and control copies, held in its own scratch for the whole pass.
+    struct Replica {
+        Tensor x;
+        std::array<Tensor, kControlTensors> local{};
+        std::array<const Tensor*, kControlTensors> control{};
+    };
+    std::vector<Replica> replicas(ranks);
+    std::vector<WorkspaceArena::Scope> pass_scopes;
+    pass_scopes.reserve(ranks);
+    replicas[0].x = x;
+    for (std::size_t rank = 1; rank < ranks; ++rank) {
+        ScopedDeviceRank rank_guard(ctx_, rank);
+        ScopedArenaRank arena_guard(work_, rank);
+        pass_scopes.push_back(work_.scope());
+        Replica& replica = replicas[rank];
+        replica.x        = work_.alloc(x.dtype, {x.ne[0], x.ne[1]});
+        runtime.forward[rank - 1].recv(replica.x.data, replica.x.bytes(), slot, ctx_.stream);
+        Tensor control = work_.alloc(DType::I32, {static_cast<std::int32_t>(total)});
+        runtime.control[rank - 1].recv(control.data, control_bytes, slot, ctx_.stream);
+        for (std::size_t i = 0; i < kControlTensors; ++i) {
+            if (offset[i] < 0) { continue; }
+            replica.local[i]      = *sources[i];
+            replica.local[i].data = static_cast<std::int32_t*>(control.data) + offset[i];
+            replica.control[i]    = &replica.local[i];
+        }
+    }
+
+    // Position-split attention: each rank's query heads' gates, kept from its attention to its
+    // merge, in its own scratch for the whole pass.
+    const bool positions = tp.shares.front().attention_positions;
+    std::vector<Tensor> attention_gates(ranks);
+    if (positions) {
+        const auto head_dim = dimension(config_.attention->head_dim);
+        for (std::size_t rank = 0; rank < ranks; ++rank) {
+            std::optional<ScopedArenaRank> arena_guard;
+            if (rank != 0) { arena_guard.emplace(work_, rank); }
+            const auto heads = static_cast<std::int32_t>(tp.shares[rank].query_head_end -
+                                                         tp.shares[rank].query_head_begin);
+            attention_gates[rank] = work_.alloc(DType::BF16, {head_dim, heads, x.ne[1]});
+        }
+    }
+
+    // Issues `share` for rank `rank` on its device, against its scratch, control and replica.
+    const auto on_rank = [&](std::size_t rank, const auto& share) {
+        std::optional<ScopedDeviceRank> device_guard;
+        std::optional<ScopedArenaRank> arena_guard;
+        std::optional<ScopedControl> control_guard;
+        if (rank != 0) {
+            device_guard.emplace(ctx_, rank);
+            arena_guard.emplace(work_, rank);
+            control_guard.emplace(current, replicas[rank].control, slots);
+        }
+        tensor_rank_ = rank;
+        try {
+            auto scope = work_.scope();
+            share(replicas[rank].x);
+        } catch (...) {
+            tensor_rank_        = 0;
+            residual_partial_   = nullptr;
+            attention_partial_  = nullptr;
+            attention_gate_     = nullptr;
+            throw;
+        }
+        tensor_rank_ = 0;
+    };
+    // One exchange: ranks [0, contributors) project into their partials, every replica adds them.
+    std::size_t next_exchange = 0;
+    const auto exchange_step  = [&](std::size_t contributors, const auto& share) {
+        const std::size_t exchange_slot = next_exchange;
+        next_exchange ^= 1U;
+        for (std::size_t rank = 0; rank < ranks; ++rank) {
+            on_rank(rank, [&](Tensor& replica) {
+                const bool contributes = rank < contributors;
+                if (contributes) {
+                    Tensor partial(exchange.partial(rank, exchange_slot), DType::FP32,
+                                   {x.ne[0], x.ne[1]});
+                    residual_partial_ = &partial;
+                    share(rank, replica);
+                    residual_partial_ = nullptr;
+                }
+                exchange.publish(rank, exchange_slot, contributes ? partial_bytes : 0,
+                                 ctx_.stream);
+            });
+        }
+        for (std::size_t rank = 0; rank < ranks; ++rank) {
+            on_rank(rank, [&](Tensor& replica) {
+                exchange.reduce(rank, exchange_slot, static_cast<__nv_bfloat16*>(replica.data),
+                                values, contributors, ctx_.stream);
+            });
+        }
+    };
+
+    // The ranks holding KV heads, a prefix of the ranks, run attention; the rest wait for its sum.
+    std::size_t attention_ranks = 0;
+    while (attention_ranks < tp.shares.size() &&
+           tp.shares[attention_ranks].kv_head_end > tp.shares[attention_ranks].kv_head_begin) {
+        ++attention_ranks;
+    }
+    const auto layers = static_cast<std::uint32_t>(parameters_.text.layers.size());
+    for (std::uint32_t layer = 0; layer < layers; ++layer) {
+        const auto block = [&](std::size_t rank) -> const BlockParameters& {
+            return rank == 0 ? parameters_.text.layers[layer]
+                             : parameters_.text.rank_layers[rank - 1][layer];
+        };
+        const bool full    = config_.layer_types[layer] == MixerKind::FullAttention;
+        const auto compact = dimension(config_.compact_layer_indices[layer]);
+        try {
+            if (layer < layer_ready_.size()) {
+                CUDA_CHECK(cudaStreamWaitEvent(entry_stream, layer_ready_[layer], 0));
+            }
+            if (full && positions) {
+                // Every rank attends over its own pages into a slot of the exchange and publishes
+                // the partial whole; the next exchange merges each rank's query heads from all of
+                // them and sums the output projections' shares.
+                const std::size_t gather_slot = next_exchange;
+                next_exchange ^= 1U;
+                const std::size_t gather_bytes =
+                    ops::causal_attention_partial_elements(
+                        static_cast<std::int32_t>(config_.attention->num_attention_heads),
+                        x.ne[1]) *
+                    sizeof(float);
+                if (gather_bytes > exchange.slot_bytes()) {
+                    throw std::runtime_error("a position-split attention exceeds its links");
+                }
+                for (std::size_t rank = 0; rank < ranks; ++rank) {
+                    on_rank(rank, [&](Tensor& replica) {
+                        attention_partial_ = exchange.partial(rank, gather_slot);
+                        attention_gate_    = &attention_gates[rank];
+                        attn_mix(block(rank), replica, compact, ph);
+                        attention_partial_ = nullptr;
+                        attention_gate_    = nullptr;
+                        exchange.publish_whole(rank, gather_slot, gather_bytes, ctx_.stream);
+                    });
+                }
+                exchange_step(ranks, [&](std::size_t rank, Tensor& replica) {
+                    std::array<const float*, ops::kCausalAttentionMaximumMergeRanks> parts{};
+                    exchange.gather(rank, gather_slot, std::span<const float*>(parts.data(), ranks),
+                                    ctx_.stream);
+                    attn_merge_output(block(rank), replica,
+                                      std::span<const float* const>(parts.data(), ranks),
+                                      attention_gates[rank], ph);
+                });
+            } else if (full) {
+                exchange_step(attention_ranks, [&](std::size_t rank, Tensor& replica) {
+                    attn_mix(block(rank), replica, compact, ph);
+                });
+            } else {
+                exchange_step(ranks, [&](std::size_t rank, Tensor& replica) {
+                    gdn_mix(block(rank), replica, compact, ph);
+                });
+            }
+            exchange_step(ranks, [&](std::size_t rank, Tensor& replica) {
+                mlp_tail(block(rank), replica, ph,
+                         rank == 0 && layer + 1 < layers
+                             ? next_projection_hints(static_cast<int>(layer))
+                             : ops::SparseMoeHints{});
+            });
+            // Rank 0's replica is one device's residual after the layer: a masked drafter's
+            // target features are tapped from it.
+            if constexpr (Tap::enabled) {
+                tap.capture_layer(static_cast<int>(layer), x, entry_stream);
+            }
+        } catch (const std::exception& error) {
+            throw std::runtime_error("text/layers/" + std::to_string(layer) +
+                                     (ph == Phase::Prefill ? " prefill" : " verify") +
+                                     " tensor-parallel columns=" + std::to_string(x.ne[1]) + ": " +
+                                     error.what());
+        }
+    }
+    // A captured pass ends with every rank joined back into rank 0's stream.
+    for (std::size_t rank = 1; rank < ranks; ++rank) {
+        tp.joined[rank - 1].record(ctx_.stream_for_rank(rank));
+        tp.joined[rank - 1].wait(entry_stream);
+    }
+    layer_ready_ = {};
+}
+
 template <class Tap>
 void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
     if (!parameters_.text.split_execution()) {
@@ -1447,6 +1865,10 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
     }
     if (stage_runtime_ == nullptr) {
         throw std::logic_error("a split model needs its stage runtime");
+    }
+    if (stage_runtime_->tensor_parallel) {
+        run_tensor_parallel(x, ph, tap);
+        return;
     }
     run_staged(x, ph, tap);
 }
@@ -1510,7 +1932,8 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
         mtp_proposal_extent_ > static_cast<std::uint32_t>(io_.mtp->draft_tokens.ne[0])) {
         throw std::logic_error("MTP proposal extent exceeds the configured draft window");
     }
-    int t0 = 0;
+    int t0          = 0;
+    bool token_left = false;
     for (; t0 < T;) {
         int len = std::min(chunk, T - t0);
         if (split_rel > 0 && t0 < split_rel && t0 + len > split_rel) { len = split_rel - t0; }
@@ -1642,6 +2065,11 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                                       dimension(parameters_.model.resources().public_token_count),
                                       ids, values, lse, io_.logprob_active, work_, s);
                 }
+                if (readout_count_ > 0) {
+                    ops::readout_logprobs(logits, io_.readout_ids, readout_count_,
+                                          dimension(parameters_.model.resources().public_token_count),
+                                          io_.readout_values, s);
+                }
                 // Set io_.pos to the bonus token's absolute position (base + T) before picking so
                 // the sampler RNG is keyed by it (prefill purpose keeps it distinct from the first
                 // decode step, which reuses the same io_.pos).
@@ -1654,6 +2082,10 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                 } else {
                     ops::argmax(logits, io_.token,
                                 dimension(parameters_.model.resources().public_token_count), s);
+                }
+                if (first_token_hook_) {
+                    first_token_hook_();
+                    token_left = true;
                 }
             }
 
@@ -1767,12 +2199,230 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
 
     prefill_split_frontier_ = -1;
 
-    timing.begin_wait();
-    ctx_.synchronize();
-    timing.end_wait();
+    // A token that has left is waited for by the caller; the drafter's work behind it is not.
+    if (!token_left) {
+        timing.begin_wait();
+        ctx_.synchronize();
+        timing.end_wait();
+    }
     work_.reset();
     return PrefillChunkResult{.processed_tokens = static_cast<std::uint32_t>(t0),
                               .finalized        = finalize_at_end && t0 == T,
+                              .timing           = timing.finish()};
+}
+
+PrefillChunkResult TextContext::prefill_final_batch(std::span<const PrefillSegment> segments,
+                                                    PrefillBatchHost host) {
+    runtime::ExecutionTimingRecorder timing;
+    if (segments.empty() || segments.size() > kMaximumPrefillSegments || host.tokens == nullptr ||
+        host.top_ids == nullptr || host.top_values == nullptr || host.readout == nullptr) {
+        throw std::invalid_argument("batched prefill needs one to 64 segments and host outputs");
+    }
+    if (prefill_hidden_.data == nullptr || mtp_enabled() || parameters_.text.split_execution()) {
+        throw std::logic_error(
+            "batched prefill runs without drafter work or stages and needs prefill hidden");
+    }
+    cudaStream_t s          = ctx_.stream;
+    const auto count        = static_cast<std::int32_t>(segments.size());
+    constexpr auto readouts = static_cast<std::int32_t>(ops::kReadoutLogprobsMaximum);
+    std::vector<SegmentBinding> bindings(segments.size());
+    std::vector<std::int32_t> ids;
+    std::vector<std::int32_t> positions_host;
+    std::vector<std::int32_t> rows_host(segments.size());
+    // Output rows: the segments that read their last column, in segment order.
+    std::vector<std::int32_t> output_segments;
+    std::vector<std::int32_t> sample_rows;
+    std::vector<std::int32_t> frontiers_host;
+    std::vector<std::int32_t> readout_ids_host;
+    bool any_readout     = false;
+    std::int32_t columns = 0;
+    for (std::int32_t i = 0; i < count; ++i) {
+        const PrefillSegment& segment = segments[static_cast<std::size_t>(i)];
+        const std::uint64_t frontier  = std::uint64_t(segment.begin) + segment.ids.size();
+        if (segment.ids.empty() ||
+            (segment.output != SegmentOutput::None && segment.sampling == nullptr) ||
+            segment.readout.size() > static_cast<std::size_t>(readouts) ||
+            (segment.output == SegmentOutput::None && !segment.readout.empty()) ||
+            (segment.state_destination_slot < 0 && segment.output == SegmentOutput::Sample) ||
+            frontier > static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max()) ||
+            std::uint64_t(columns) + segment.ids.size() > prefill_chunk_) {
+            throw std::invalid_argument("batched prefill segment is outside the pass");
+        }
+        const auto length = static_cast<std::int32_t>(segment.ids.size());
+        ids.insert(ids.end(), segment.ids.begin(), segment.ids.end());
+        for (std::int32_t t = 0; t < length; ++t) {
+            positions_host.push_back(static_cast<std::int32_t>(segment.begin) + t);
+        }
+        rows_host[static_cast<std::size_t>(i)] = segment.kv_table_row;
+        if (segment.output != SegmentOutput::None) {
+            const auto row = static_cast<std::int32_t>(output_segments.size());
+            output_segments.push_back(i);
+            frontiers_host.push_back(static_cast<std::int32_t>(frontier));
+            readout_ids_host.resize(readout_ids_host.size() + static_cast<std::size_t>(readouts),
+                                    0);
+            std::copy(segment.readout.begin(), segment.readout.end(),
+                      readout_ids_host.end() - readouts);
+            any_readout = any_readout || !segment.readout.empty();
+            if (segment.output == SegmentOutput::Sample) { sample_rows.push_back(row); }
+        }
+        const auto visible = static_cast<std::uint32_t>(frontier);
+        bindings[static_cast<std::size_t>(i)] = SegmentBinding{
+            .column                 = columns,
+            .columns                = length,
+            .envelope               = {.min_visible_keys   = visible,
+                                       .max_visible_keys   = visible,
+                                       .fast_prompt_kernel = fast_prefill_kernel_,
+                                       .small_prefill      = true},
+            .state_source_slot      = segment.state_source_slot,
+            .state_destination_slot = segment.state_destination_slot,
+        };
+        columns += length;
+    }
+    if (sample_rows.size() > kMaximumConcurrency) {
+        throw std::invalid_argument("batched prefill samples more rows than lanes");
+    }
+
+    work_.reset();
+    nvtx::ScopedRange chunk_range(nvtx::Name::PrefillChunk, nvtx::Category::Prefill,
+                                  static_cast<std::uint64_t>(columns));
+    rope_delta_ = 0;
+    ops::set_i32_scalar(io_.rope_delta, 0, s);
+    const auto roots = workspace::text_prefill_roots(work_, config_, columns, 0, 0);
+    Tensor ids_device = roots.ids;
+    copy_i32(ids.data(), ids_device, s);
+    Tensor positions = roots.positions;
+    copy_i32(positions_host.data(), positions, s);
+    Tensor rows = work_.alloc(DType::I32, {count});
+    copy_i32(rows_host.data(), rows, s);
+    for (std::int32_t i = 0; i < count; ++i) {
+        SegmentBinding& binding = bindings[static_cast<std::size_t>(i)];
+        binding.positions       = positions.slice(0, binding.column, binding.columns);
+        binding.kv_table_row    = rows.slice(0, i, 1);
+    }
+
+    Tensor x = roots.residual;
+    {
+        // Token-wise work reads the widest segment's envelope; attention uses each segment's own.
+        const auto widest = std::max_element(
+            bindings.begin(), bindings.end(), [](const SegmentBinding& a, const SegmentBinding& b) {
+                return a.envelope.max_visible_keys < b.envelope.max_visible_keys;
+            });
+        ScopedPositions scoped_cache(active_cache_positions_, positions);
+        ScopedPositions scoped_rope(active_rope_positions_, positions);
+        ScopedEnvelope scoped_envelope(active_causal_attention_envelope_, widest->envelope);
+        ScopedValue<std::span<const SegmentBinding>> scoped_segments(
+            active_segments_, std::span<const SegmentBinding>(bindings.data(), bindings.size()));
+        embed_tokens(ids_device, *embed_, parameters_.text.token_embedding_signs, x, s);
+        run_layers(x, Phase::Prefill);
+    }
+
+    Tensor xf = matrix_window(prefill_hidden_, columns);
+    ops::rmsnorm(x, *final_norm_, config_.rms_norm_eps, true, xf, s);
+    const auto outputs = static_cast<std::int32_t>(output_segments.size());
+    if (outputs != 0) {
+        Tensor last = work_.alloc(DType::BF16, {dimension(config_.hidden_size), outputs});
+        for (std::int32_t row = 0; row < outputs; ++row) {
+            const SegmentBinding& binding =
+                bindings[static_cast<std::size_t>(output_segments[static_cast<std::size_t>(row)])];
+            const Tensor source = xf.slice(1, binding.column + binding.columns - 1, 1);
+            CUDA_CHECK(cudaMemcpyAsync(last.slice(1, row, 1).data, source.data, source.bytes(),
+                                       cudaMemcpyDeviceToDevice, s));
+        }
+        const std::int32_t physical_rows = io_.logits.ne[0];
+        const auto token_domain = dimension(parameters_.model.resources().public_token_count);
+        Tensor logits           = work_.alloc(DType::BF16, {physical_rows, outputs});
+        project(last, *lm_head_, logits, work_, s);
+
+        // The logprob gather reads one contiguous sampling record per row.
+        const DeviceSpan configs_span =
+            work_.alloc_bytes(sizeof(ops::SamplingConfig) * static_cast<std::size_t>(outputs));
+        auto* configs = static_cast<ops::SamplingConfig*>(configs_span.data);
+        for (std::int32_t row = 0; row < outputs; ++row) {
+            const PrefillSegment& segment =
+                segments[static_cast<std::size_t>(output_segments[static_cast<std::size_t>(row)])];
+            CUDA_CHECK(cudaMemcpyAsync(configs + row, segment.sampling, sizeof(ops::SamplingConfig),
+                                       cudaMemcpyDeviceToDevice, s));
+        }
+        // The rows' logprob records, gathered before sampling adds a sampled token to its
+        // penalty counts; a device no-op unless logprobs are armed.
+        Tensor top_ids    = work_.alloc(DType::I32, {ops::kLogprobTopK, 1, outputs});
+        Tensor top_values = work_.alloc(DType::FP32, {ops::kLogprobTopK, 1, outputs});
+        Tensor lse        = work_.alloc(DType::FP32, {1, outputs});
+        if (io_.logprob_active.data != nullptr) {
+            ops::logprob_topk(logits.view({physical_rows, 1, outputs}), configs, nullptr,
+                              token_domain, top_ids, top_values, lse, io_.logprob_active, work_, s);
+        }
+        if (any_readout) {
+            Tensor readout_ids = work_.alloc(DType::I32, {readouts, outputs});
+            copy_i32(readout_ids_host.data(), readout_ids, s);
+            Tensor readout_values = work_.alloc(DType::FP32, {readouts, outputs});
+            for (std::int32_t row = 0; row < outputs; ++row) {
+                const auto requested = static_cast<std::int32_t>(
+                    segments[static_cast<std::size_t>(
+                                 output_segments[static_cast<std::size_t>(row)])]
+                        .readout.size());
+                if (requested == 0) { continue; }
+                Tensor values = readout_values.slice(1, row, 1).view({readouts});
+                ops::readout_logprobs(logits.slice(1, row, 1),
+                                      readout_ids.slice(1, row, 1).view({readouts}), requested,
+                                      token_domain, values, s);
+            }
+            CUDA_CHECK(cudaMemcpyAsync(host.readout, readout_values.data, readout_values.bytes(),
+                                       cudaMemcpyDeviceToHost, s));
+        }
+        // Sampled rows draw from their own logits, compacted so the sampler sees lanes only.
+        Tensor tokens = work_.alloc(DType::I32, {outputs});
+        if (!sample_rows.empty()) {
+            const auto sampled   = static_cast<std::int32_t>(sample_rows.size());
+            Tensor sample_logits = work_.alloc(DType::BF16, {physical_rows, sampled});
+            const DeviceSpan sample_configs_span =
+                work_.alloc_bytes(sizeof(ops::SamplingConfig) * static_cast<std::size_t>(sampled));
+            auto* sample_configs = static_cast<ops::SamplingConfig*>(sample_configs_span.data);
+            std::vector<std::int32_t> sample_positions_host;
+            for (std::int32_t k = 0; k < sampled; ++k) {
+                const std::int32_t row = sample_rows[static_cast<std::size_t>(k)];
+                CUDA_CHECK(
+                    cudaMemcpyAsync(sample_logits.slice(1, k, 1).data, logits.slice(1, row, 1).data,
+                                    logits.slice(1, row, 1).bytes(), cudaMemcpyDeviceToDevice, s));
+                CUDA_CHECK(cudaMemcpyAsync(sample_configs + k, configs + row,
+                                           sizeof(ops::SamplingConfig), cudaMemcpyDeviceToDevice,
+                                           s));
+                sample_positions_host.push_back(frontiers_host[static_cast<std::size_t>(row)]);
+            }
+            Tensor sample_positions = work_.alloc(DType::I32, {sampled});
+            copy_i32(sample_positions_host.data(), sample_positions, s);
+            Tensor sampled_tokens = work_.alloc(DType::I32, {sampled});
+            ops::sample(sample_logits, sampled_tokens, token_domain, sample_configs,
+                        sample_positions, ops::kSamplePurposePrefill, work_, s);
+            for (std::int32_t k = 0; k < sampled; ++k) {
+                const std::int32_t row = sample_rows[static_cast<std::size_t>(k)];
+                CUDA_CHECK(cudaMemcpyAsync(tokens.slice(0, row, 1).data,
+                                           sampled_tokens.slice(0, k, 1).data, sizeof(std::int32_t),
+                                           cudaMemcpyDeviceToDevice, s));
+            }
+        }
+        CUDA_CHECK(
+            cudaMemcpyAsync(host.tokens, tokens.data, tokens.bytes(), cudaMemcpyDeviceToHost, s));
+        CUDA_CHECK(cudaMemcpyAsync(host.top_ids, top_ids.data, top_ids.bytes(),
+                                   cudaMemcpyDeviceToHost, s));
+        CUDA_CHECK(cudaMemcpyAsync(host.top_values, top_values.data, top_values.bytes(),
+                                   cudaMemcpyDeviceToHost, s));
+    }
+
+    timing.begin_wait();
+    ctx_.synchronize();
+    timing.end_wait();
+    // A read's token is the most likely one, the first of its logprob record (the lower id on a
+    // tie, as greedy sampling picks).
+    for (std::int32_t row = 0; row < outputs; ++row) {
+        if (segments[static_cast<std::size_t>(output_segments[static_cast<std::size_t>(row)])]
+                .output == SegmentOutput::Read) {
+            host.tokens[row] = host.top_ids[static_cast<std::size_t>(row) * ops::kLogprobTopK];
+        }
+    }
+    work_.reset();
+    return PrefillChunkResult{.processed_tokens = static_cast<std::uint32_t>(columns),
+                              .finalized        = outputs != 0,
                               .timing           = timing.finish()};
 }
 

@@ -459,6 +459,34 @@ PrefillProgress Program::advance_prefill(SequenceHandle sequence,
     return result;
 }
 
+std::optional<PrefillBatchUnit>
+Program::prefill_batch_unit(SequenceHandle sequence) const noexcept {
+    return impl_->prefill_batch_unit(sequence);
+}
+
+std::uint32_t Program::prefill_batch_capacity() const noexcept { return impl_->prefill_chunk; }
+
+std::uint32_t Program::prefill_batch_segments() const noexcept {
+    return static_cast<std::uint32_t>(execution::kMaximumPrefillSegments);
+}
+
+bool Program::runs_branched_reads() const noexcept {
+    return !impl_->stage_runtime && impl_->prefill_hidden.data != nullptr &&
+           impl_->round_host.has_value();
+}
+
+std::uint32_t Program::pending_branch_tokens(SequenceHandle sequence) const noexcept {
+    return impl_->pending_branch_tokens(sequence);
+}
+
+runtime::ExecutionTiming Program::prefill_batch(std::span<const SequenceHandle> sequences,
+                                                runtime::ExecutionTiming* failed_timing) {
+    if (impl_->experts) { impl_->experts->check(); }
+    auto result = impl_->prefill_batch(sequences, failed_timing);
+    if (impl_->experts) { impl_->experts->check(); }
+    return result;
+}
+
 CaptureAssessment
 Program::inspect_capture(const CaptureOffer& offer, const SharedPrefixHandle* exact_shared,
                          const SharedPrefixHandle* replacement,
@@ -761,7 +789,8 @@ std::size_t prepare_vision_overlay(const execution::Parameters& parameters, Devi
             "embedding, proposal head and MTP or drafter weights provide " +
             mib(pool->evictable_tail_bytes()) +
             "; lower --vision-max-merged, use --vision-residency resident, or drop a flag that "
-            "shrinks those weights (--embedding-q4/q6, --lm-head-q4/q6)");
+            "shrinks or moves those weights (--embedding-q4/q6, --embedding-residency host, "
+            "--lm-head-q4/q6)");
     }
     pool->capture_window_mirror(window, device.transfer_stream);
     return pool->window_capacity_bytes();

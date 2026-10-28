@@ -1,7 +1,20 @@
+if(NINFER_WINDOWS_KERNEL_DLL)
+  # Both the GGML bridge and Ops use one device-tier probe and cache, and one store of installed
+  # route profiles, in the DLL: the bridge's vector kernels read their schedules from the profiles.
+  add_library(ninfer_device_tier OBJECT "${CMAKE_CURRENT_LIST_DIR}/common/device_tier.cu")
+  ninfer_internal_includes(ninfer_device_tier)
+  ninfer_cuda_archive(ninfer_device_tier)
+  add_library(ninfer_device_route OBJECT "${CMAKE_CURRENT_LIST_DIR}/common/device_route.cpp")
+  ninfer_internal_includes(ninfer_device_route)
+  target_link_libraries(ninfer_device_route PRIVATE ${NINFER_CUDART_TARGET})
+else()
+  target_sources(ninfer_ops PRIVATE
+    "${CMAKE_CURRENT_LIST_DIR}/common/device_route.cpp"
+    "${CMAKE_CURRENT_LIST_DIR}/common/device_tier.cu")
+endif()
+
 target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/weight_input.cpp"
-  "${CMAKE_CURRENT_LIST_DIR}/common/device_route.cpp"
-  "${CMAKE_CURRENT_LIST_DIR}/common/device_tier.cu"
   "${CMAKE_CURRENT_LIST_DIR}/launcher/add_bias.cu"
   "${CMAKE_CURRENT_LIST_DIR}/launcher/argmax.cu"
   "${CMAKE_CURRENT_LIST_DIR}/launcher/cast.cu"
@@ -29,6 +42,7 @@ target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/launcher/scatter.cu"
   "${CMAKE_CURRENT_LIST_DIR}/launcher/sigmoid_gate_mul.cu"
   "${CMAKE_CURRENT_LIST_DIR}/launcher/silu_and_mul.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/launcher/readout_logprobs.cu"
   "${CMAKE_CURRENT_LIST_DIR}/launcher/target_logprobs.cu"
   "${CMAKE_CURRENT_LIST_DIR}/launcher/vision_pos_embed.cu"
   "${CMAKE_CURRENT_LIST_DIR}/wrapper/add_bias.cpp"
@@ -70,6 +84,7 @@ target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/moe_experts/moe_expert_cpu.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/moe_experts/gguf_expert_cpu.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/wrapper/silu_mul.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/wrapper/readout_logprobs.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/wrapper/target_logprobs.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/wrapper/vision_pos_embed.cpp"
 )

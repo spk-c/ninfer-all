@@ -3,14 +3,17 @@
 #include "artifact/formats.h"
 #include "artifact/reader.h"
 #include "core/arena.h"
+#include "core/host_pages.h"
 #include "core/file_read_error.h"
 #include "core/startup.h"
+#include "core/tensor_parallel.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
 #include "models/qwen3_5/program/vision_control.h"
 #include "models/qwen4_exp/ngram_component.h"
 #include "models/qwen4_exp/ngram_profile.h"
 #include "ninfer/ops/argmax.h"
 #include "ninfer/ops/logprob_topk.h"
+#include "ninfer/ops/readout_logprobs.h"
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/speculative_round.h"
 #include "ninfer/ops/target_logprobs.h"
@@ -18,6 +21,7 @@
 #include "runtime/contract/grammar_masks.h"
 #include "runtime/contract/lookup_draft.h"
 #include "runtime/contract/mtp_adaptive.h"
+#include "runtime/contract/rope_scaling.h"
 #include "runtime/engine/diagnostics.h"
 #include "runtime/engine/worker_recovery.h"
 #include "runtime/engine/effective_thinking_budget.h"
@@ -108,7 +112,8 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     }
     const SpeculativeOptions& speculative = options.speculative;
     if (speculative.backend == SpeculativeBackend::DFlash ||
-        speculative.backend == SpeculativeBackend::DFlash2) {
+        speculative.backend == SpeculativeBackend::DFlash2 ||
+        speculative.backend == SpeculativeBackend::DSpark) {
         throw std::invalid_argument(
             "Qwen3.8-Flash-Next drafts with its MTP block only (--spec mtp)");
     }
@@ -210,6 +215,16 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     load.experts      = options.expert_residency;
     load.vision       = options.enable_vision;
     load.mtp          = mtp;
+    // Tensor parallelism: every layer's mixer heads and routed experts divided over the devices,
+    // the shared expert, the head and the MTP block on the first. Without --tensor-split each
+    // device takes a share of its speed that fits beside what it holds.
+    if (options.tensor_parallel) {
+        load.tensor_split = options.tensor_split;
+        if (load.tensor_split.empty()) {
+            load.tensor_split = models::qwen4_exp::default_tensor_split(
+                reader, load, rank_free_bytes(device), rank_copy_bandwidth(device));
+        }
+    }
     StartupPhaseScope materialize(options.startup_observer, StartupPhase::TargetPlan);
     auto model = models::qwen4_exp::load_model(reader, load, device, &options.startup_observer);
     device.synchronize();
@@ -242,6 +257,12 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     executor.sequences       = options.max_concurrency;
     executor.draft_tokens    = mtp ? speculative.draft_tokens : 0;
     executor.draft_min_p     = speculative.draft_min_p;
+    // The rotation past the native window, as every family resolves it (rope_scaling.h): YaRN
+    // reaches every rotation this model makes (sparse attention, its indexer, the MTP block);
+    // linear position interpolation is refused.
+    const runtime::RopeScalingPlan rope = runtime::resolve_rope_scaling(
+        options, text.max_position_embeddings, runtime::kQwen4ExpRopeScaling);
+    executor.rope_yarn       = rope.yarn;
     // A chunk also holds a verification of every sequence at once.
     const std::uint32_t requested_chunk = options.prefill_chunk ? options.prefill_chunk : 1024;
     executor.prefill_chunk   = std::max(std::clamp<std::uint32_t>(requested_chunk, 64, 4096),
@@ -304,6 +325,25 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
                        double(instance->executor->memory().state_bytes) / 1048576.0,
                        double(instance->executor->memory().workspace_bytes) / 1048576.0,
                        double(instance->executor->memory().expert_cache_bytes) / 1048576.0);
+    if (model->tensor_parallel()) {
+        std::string keys, kv, experts;
+        const auto range = [](std::string& out, std::size_t rank, std::uint32_t begin,
+                              std::uint32_t end) {
+            out += (rank == 0 ? "" : ", ") +
+                   (begin == end ? std::string("none")
+                                 : std::to_string(begin) + "-" + std::to_string(end - 1));
+        };
+        for (std::size_t rank = 0; rank < device.size(); ++rank) {
+            const auto share = model->share(rank);
+            range(keys, rank, share.key_head_begin, share.key_head_end);
+            range(kv, rank, share.kv_head_begin, share.kv_head_end);
+            range(experts, rank, share.expert_begin, share.expert_end);
+        }
+        publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                           "Qwen3.8-Flash-Next: tensor parallelism, by device Gated DeltaNet key "
+                           "heads %s, sparse-attention KV heads %s, routed experts %s",
+                           keys.c_str(), kv.c_str(), experts.c_str());
+    }
     if (const auto memory = instance->executor->memory(); memory.streamed_kv) {
         publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
                            "Qwen3.8-Flash-Next: sparse-attention KV in pinned host memory "
@@ -329,6 +369,11 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
                                "Qwen3.8-Flash-Next drafts with its MTP block only; n-gram copy "
                                "proposals (--ngram-draft-tokens) are not available for it");
         }
+    }
+    if (executor.rope_yarn.active()) {
+        publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                           "Qwen3.8-Flash-Next: YaRN at factor %.4g past the native %u positions",
+                           double(executor.rope_yarn.factor), executor.rope_yarn.native_context);
     }
     if (table.disabled && has_ple) {
         publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Warning,
@@ -358,6 +403,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     out.load.pinned_weight_bytes      = stats.pinned_bytes;
     out.load.device_object_count      = stats.device_object_count;
     out.load.host_object_count        = stats.host_object_count;
+    out.load.rope                     = rope.summary;
     const auto& config                = model->config();
     out.model_metadata.model_id       = out.load.model_name;
     out.model_metadata.vocab_size     = config.vocab_size;
@@ -414,6 +460,22 @@ struct Qwen4ExpCore::Request {
     std::uint32_t anchor_at = 0;
     bool reusable           = true;
     bool media              = false; // images or video: encoded at the prompt's first chunk
+    // CacheRetentionHint::Disposable: no request continues where this one ends (a decision read),
+    // so the store keeps no image of its end.
+    bool disposable = false;
+    // Engine::submit_branches: the prompt is the branches' shared prefix, and once it is in, each
+    // branch runs from the snapshot at its end and its first token is read. branch_fed counts the
+    // current branch's tokens fed, branch_results the branches read; the first branch's token and
+    // record are what the content publishes.
+    std::shared_ptr<const std::vector<runtime::ReadBranch>> branches;
+    std::uint32_t branch_fed = 0;
+    std::vector<BranchResult> branch_results;
+    TokenId branch_token = 0;
+    runtime::RawTokenLogprob branch_record;
+    // Prefixes other prompts are expected to share (a declared cache boundary, the end of the
+    // leading system messages or tool declarations), ascending and below anchor_at: a prompt step
+    // ends at each, and the state there goes to the store for them.
+    std::vector<std::uint32_t> shared_at;
 
     // The worker's progress with an admitted request.
     std::uint32_t slot      = 0;
@@ -453,6 +515,7 @@ struct Qwen4ExpCore::Impl {
         std::vector<TokenId> anchor;
         models::qwen4_exp::SequenceSnapshot snapshot;
         std::uint64_t last_used = 0;
+        bool disposable         = false; // its last request's
     };
 
     // One row of a sampling call: the request's parameters at its position.
@@ -463,6 +526,8 @@ struct Qwen4ExpCore::Impl {
         bool counts                              = false;
         bool logprobs                            = false;
         const std::uint32_t* mask                = nullptr; // a grammar's next-token mask
+        // The typed readout's token ids, on a request's first generated token only.
+        const std::vector<TokenId>* readout = nullptr;
     };
 
     Qwen4ExpInstance& instance;
@@ -479,6 +544,7 @@ struct Qwen4ExpCore::Impl {
     // With --adaptive-mtp, the steps a round drafts and verifies: from one draft, since each draft
     // is a step of the MTP block of its own here, up to `drafts`.
     std::optional<runtime::MtpAdaptiveBatchController> mtp_controller;
+    runtime::MtpPackedPlanner packed_planner;
 
     mutable std::mutex queue_mutex;
     std::condition_variable queue_cv;
@@ -510,6 +576,8 @@ struct Qwen4ExpCore::Impl {
     // The logprob gather of a sampling call whose rows ask for it: [kLogprobTopK, rows] ids and
     // values, [rows] log-sum-exps and the gather's enabling flag, with the host copy.
     DeviceBuffer logprob_ids, logprob_values, logprob_lse, logprob_flag;
+    DeviceBuffer readout_ids, readout_values;
+    std::unique_ptr<PinnedHostBuffer> host_readout;
     std::unique_ptr<PinnedHostBuffer> host_mask, host_sample, host_logprobs;
     std::unique_ptr<WorkspaceArena> sample_workspace;
     // A speculative round's acceptance on the head device, a row per verified sequence: its
@@ -518,7 +586,7 @@ struct Qwen4ExpCore::Impl {
     // slot's token counts before the round, which a round that keeps fewer tokens than it
     // licensed restores.
     DeviceBuffer spec_drafts, spec_targets, spec_extents, spec_lengths, spec_licensed, spec_counts,
-        spec_accepted, spec_anchors, counts_backup;
+        spec_accepted, spec_anchors, spec_columns, counts_backup;
     std::unique_ptr<PinnedHostBuffer> host_spec;
 
     // The context cache past the sequences: images of the prefixes they give up (the state a
@@ -545,7 +613,7 @@ struct Qwen4ExpCore::Impl {
     // in as slowly, and huge pages took minutes), so later images reuse the pages of those the
     // store let go. host_used counts the pages images hold, within host_budget.
     static constexpr std::size_t kHostPageBytes = std::size_t(8) << 20;
-    std::vector<std::unique_ptr<PinnedHostBuffer>> host_chunks;
+    std::vector<std::unique_ptr<HostPages>> host_chunks;
     std::vector<std::byte*> free_pages;
     std::uint64_t host_budget = 0, host_used = 0;
     std::filesystem::path disk_dir;
@@ -596,6 +664,10 @@ struct Qwen4ExpCore::Impl {
         logprob_values        = DeviceBuffer(top * sizeof(float));
         logprob_lse           = DeviceBuffer(rows * width * sizeof(float));
         logprob_flag          = DeviceBuffer(sizeof(std::int32_t));
+        readout_ids           = DeviceBuffer(rows * kMaximumReadoutTokens * sizeof(std::int32_t));
+        readout_values        = DeviceBuffer(rows * kMaximumReadoutTokens * sizeof(float));
+        host_readout = std::make_unique<PinnedHostBuffer>(rows * kMaximumReadoutTokens *
+                                                          (sizeof(std::int32_t) + sizeof(float)));
         host_logprobs =
             std::make_unique<PinnedHostBuffer>(top * (sizeof(std::int32_t) + sizeof(float)));
         const std::int32_t enabled = 1;
@@ -623,8 +695,9 @@ struct Qwen4ExpCore::Impl {
             spec_counts   = plane(1);
             spec_accepted = plane(1);
             spec_anchors  = plane(1);
+            spec_columns  = plane(1);
             counts_backup = DeviceBuffer(rows * domain * sizeof(std::int32_t));
-            host_spec     = std::make_unique<PinnedHostBuffer>(rows * (drafts + width + 4) *
+            host_spec     = std::make_unique<PinnedHostBuffer>(rows * (drafts + width + 5) *
                                                                sizeof(std::int32_t));
         }
         sample_workspace                 = std::make_unique<WorkspaceArena>(workspace);
@@ -914,10 +987,13 @@ struct Qwen4ExpCore::Impl {
     }
 
     // Tokens of `held` a prompt can start from: all of them when they are a strict prefix of the
-    // prompt (its last token is always fed, since the first sample needs its logits), else none.
+    // prompt (its last token is always fed, since the first sample needs its logits), or the
+    // whole prompt for a branched read (`whole`), whose branches bring their own; else none.
     static std::uint32_t prefix_reuse(const std::vector<TokenId>& held,
-                                      const std::vector<TokenId>& prompt) {
-        if (held.empty() || held.size() >= prompt.size()) { return 0; }
+                                      const std::vector<TokenId>& prompt, bool whole = false) {
+        if (held.empty() || prompt.empty() || held.size() > prompt.size() - (whole ? 0 : 1)) {
+            return 0;
+        }
         return std::equal(held.begin(), held.end(), prompt.begin())
                    ? static_cast<std::uint32_t>(held.size())
                    : 0;
@@ -1005,13 +1081,15 @@ struct Qwen4ExpCore::Impl {
         }
     }
 
-    // The stored prefix that serves the most of `prompt`: its index and length.
+    // The stored prefix that serves the most of `prompt`: its index and length. A drafting
+    // request takes only a state its MTP block followed.
     [[nodiscard]] std::pair<std::size_t, std::uint32_t>
-    find_stored(const std::vector<TokenId>& prompt) const {
+    find_stored(const std::vector<TokenId>& prompt, bool drafting, bool whole = false) const {
         std::pair<std::size_t, std::uint32_t> best{0, 0};
         for (std::size_t i = 0; i < stored.size(); ++i) {
             if (stored[i].pages.empty() && !disk_restore) { continue; }
-            const std::uint32_t length = prefix_reuse(stored[i].tokens, prompt);
+            if (drafting && !stored[i].header.mtp_follows) { continue; }
+            const std::uint32_t length = prefix_reuse(stored[i].tokens, prompt, whole);
             if (length > best.second) { best = {i, length}; }
         }
         return best;
@@ -1087,17 +1165,26 @@ struct Qwen4ExpCore::Impl {
     // Pins `count` more free pages in one allocation.
     void pin_pages(std::size_t count) {
         if (count == 0) { return; }
-        auto chunk = std::make_unique<PinnedHostBuffer>(count * kHostPageBytes);
+        auto chunk = std::make_unique<HostPages>(count * kHostPageBytes);
+        chunk->pin();
         auto* base = static_cast<std::byte*>(chunk->data());
         for (std::size_t i = count; i-- > 0;) { free_pages.push_back(base + i * kHostPageBytes); }
         host_chunks.push_back(std::move(chunk));
     }
 
     // Pages for an image of `bytes`, pinning more when the free ones fall short; the caller has
-    // made room for them (make_host_room), so the pinned pages stay within the budget.
+    // made room for them (make_host_room), so the pinned pages stay within the budget. Empty when
+    // more pages cannot be pinned: registering them also takes device memory on every card for
+    // their page tables (2 MiB per GiB), which the expert cache may already hold.
     std::vector<std::byte*> take_pages(std::uint64_t bytes) {
         const auto count = static_cast<std::size_t>(page_rounded(bytes) / kHostPageBytes);
-        if (free_pages.size() < count) { pin_pages(count - free_pages.size()); }
+        if (free_pages.size() < count) {
+            try {
+                pin_pages(count - free_pages.size());
+            } catch (const std::exception&) {
+                return {};
+            }
+        }
         std::vector<std::byte*> pages(free_pages.end() - std::ptrdiff_t(count), free_pages.end());
         free_pages.resize(free_pages.size() - count);
         host_used += count * kHostPageBytes;
@@ -1159,6 +1246,7 @@ struct Qwen4ExpCore::Impl {
         image.path   = path;
         image.bytes  = bytes;
         image.pages  = take_pages(bytes);
+        if (image.pages.empty()) { return; }
         try {
             image.header = executor.save_image(s, at, image.pages, kHostPageBytes);
         } catch (...) {
@@ -1182,7 +1270,7 @@ struct Qwen4ExpCore::Impl {
         if (anchored) {
             store_image(s, slot.anchor, &slot.snapshot, PrefixReusePath::PrivateTurnClosure);
         }
-        if (slot.fed != slot.anchor) {
+        if (slot.fed != slot.anchor && !slot.disposable) {
             store_image(s, slot.fed, nullptr, PrefixReusePath::PrivateEndpoint);
         }
     }
@@ -1199,6 +1287,7 @@ struct Qwen4ExpCore::Impl {
             }
             Stored& image = stored[*index];
             image.pages   = take_pages(image.bytes);
+            if (image.pages.empty()) { return false; }
             std::ifstream in(image.file, std::ios::binary);
             in.seekg(std::streamoff(sizeof(FileHeader) +
                                     4 * (image.header.context.previous.size() + tokens.size())));
@@ -1262,6 +1351,20 @@ struct Qwen4ExpCore::Impl {
         }
     }
 
+    // Whether the request drafts: ExecutionOptions::speculative_drafting off (a decision read)
+    // turns the MTP block off for it.
+    [[nodiscard]] bool drafts_for(const Request& r) const {
+        return drafts > 0 && r.options.execution.speculative_drafting;
+    }
+
+    // A request that does not draft runs its prompt without the MTP block, whose catch-up over
+    // each prompt step it would never use; its sequence's snapshots and images carry no MTP state.
+    void skip_drafter(const Request& r) {
+        if (drafts > 0 && !r.options.execution.speculative_drafting) {
+            instance.executor->stop_drafting(r.slot);
+        }
+    }
+
     void begin(const std::shared_ptr<Request>& request, std::uint32_t s) {
         Request& r          = *request;
         Slot& slot          = slots[s];
@@ -1279,9 +1382,17 @@ struct Qwen4ExpCore::Impl {
         // longest prefix the store keeps; what the sequence held goes to the store first.
         std::uint32_t reused = 0;
         if (reuse_prefixes && r.reusable) {
-            const std::uint32_t live       = prefix_reuse(slot.fed, r.prompt_tokens);
-            const std::uint32_t anchored   = prefix_reuse(slot.anchor, r.prompt_tokens);
-            const auto [image, from_store] = find_stored(r.prompt_tokens);
+            // A drafting request resumes only from a state its MTP block followed: a read's
+            // prompt passes skip the block (stop_drafting).
+            const bool drafting          = drafts_for(r);
+            const bool whole             = r.branches != nullptr;
+            const std::uint32_t live     = drafting && !executor.can_draft(s)
+                                               ? 0
+                                               : prefix_reuse(slot.fed, r.prompt_tokens, whole);
+            const std::uint32_t anchored = drafting && !slot.snapshot.mtp_follows
+                                               ? 0
+                                               : prefix_reuse(slot.anchor, r.prompt_tokens, whole);
+            const auto [image, from_store] = find_stored(r.prompt_tokens, drafting, whole);
             if (from_store > std::max(live, anchored)) {
                 const std::vector<TokenId> tokens = stored[image].tokens;
                 const PrefixReusePath path        = stored[image].path;
@@ -1310,10 +1421,12 @@ struct Qwen4ExpCore::Impl {
             // The snapshot's prefix is about to be overwritten.
             slot.anchor.clear();
         }
-        slot.request   = request;
-        slot.last_used = ++use_clock;
+        slot.request    = request;
+        slot.last_used  = ++use_clock;
+        slot.disposable = r.disposable;
         r.reused = r.prefilled = reused;
-        if (drafts > 0) {
+        skip_drafter(r);
+        if (drafts_for(r)) {
             r.speculative.backend      = SpeculativeBackend::Mtp;
             r.speculative.enabled      = true;
             r.speculative.draft_window = drafts;
@@ -1418,16 +1531,27 @@ struct Qwen4ExpCore::Impl {
             1, (std::uint64_t(decode_rounds_per_prefill) * tokens + chunk - 1) / chunk));
     }
 
-    // The prompt tokens the request's next prefill step computes. A media prompt goes chunk by
-    // chunk; a text prompt in spans where the executor has them. A span is one step, which with
-    // the experts off the GPU lasts seconds, and the requests that are decoding wait for all of
-    // it: while any decodes, a step is two chunks at most.
+    // The prompt tokens the request's next prefill step computes: a span where the executor has
+    // them, else a chunk. A span is one step, which with the experts off the GPU lasts seconds,
+    // and the requests that are decoding wait for all of it: while any decodes, a step is two
+    // chunks at most.
     [[nodiscard]] std::uint32_t prompt_step_tokens(const Request& r) const {
         const auto& executor             = *instance.executor;
         const auto prompt_n              = static_cast<std::uint32_t>(r.prompt_tokens.size());
-        const std::uint32_t until        = r.prefilled < r.anchor_at ? r.anchor_at : prompt_n;
+        if (r.branches && r.prefilled == prompt_n) {
+            const std::size_t left =
+                (*r.branches)[r.branch_results.size()].tokens.size() - r.branch_fed;
+            return static_cast<std::uint32_t>(std::min<std::size_t>(left, executor.prompt_step()));
+        }
+        std::uint32_t until = r.prefilled < r.anchor_at ? r.anchor_at : prompt_n;
+        for (const std::uint32_t frontier : r.shared_at) {
+            if (frontier > r.prefilled) {
+                until = std::min(until, frontier);
+                break;
+            }
+        }
         const std::uint32_t chunk_tokens = executor.options().prefill_chunk;
-        std::uint32_t step               = r.media ? chunk_tokens : executor.prompt_step();
+        std::uint32_t step               = executor.prompt_step();
         const bool peers_decoding =
             std::any_of(slots.begin(), slots.end(), [&](const Slot& other) {
                 return other.request && other.request.get() != &r && other.request->decoding;
@@ -1539,6 +1663,35 @@ struct Qwen4ExpCore::Impl {
             CUDA_CHECK(cudaMemcpyAsync(host_values, logprob_values.p, top * sizeof(float),
                                        cudaMemcpyDeviceToHost, stream));
         }
+        auto* readout_host_ids = static_cast<std::int32_t*>(host_readout->data());
+        auto* readout_host_values =
+            reinterpret_cast<float*>(readout_host_ids + slots.size() * kMaximumReadoutTokens);
+        const bool read = std::any_of(rows.begin(), rows.end(),
+                                      [](const SampleRow& row) { return row.readout != nullptr; });
+        if (read) {
+            for (std::size_t b = 0; b < n; ++b) {
+                if (rows[b].readout == nullptr) { continue; }
+                std::copy(rows[b].readout->begin(), rows[b].readout->end(),
+                          readout_host_ids + b * kMaximumReadoutTokens);
+            }
+            CUDA_CHECK(cudaMemcpyAsync(readout_ids.p, readout_host_ids,
+                                       n * kMaximumReadoutTokens * sizeof(std::int32_t),
+                                       cudaMemcpyHostToDevice, stream));
+            for (std::size_t b = 0; b < n; ++b) {
+                if (rows[b].readout == nullptr) { continue; }
+                const auto offset = b * kMaximumReadoutTokens;
+                const Tensor ids(static_cast<std::int32_t*>(readout_ids.p) + offset, DType::I32,
+                                 {static_cast<std::int32_t>(kMaximumReadoutTokens)});
+                Tensor values(static_cast<float*>(readout_values.p) + offset, DType::FP32,
+                              {static_cast<std::int32_t>(kMaximumReadoutTokens)});
+                ops::readout_logprobs(logits.slice(1, static_cast<std::int32_t>(b), 1), ids,
+                                      static_cast<std::int32_t>(rows[b].readout->size()),
+                                      static_cast<std::int32_t>(domain), values, stream);
+            }
+            CUDA_CHECK(cudaMemcpyAsync(readout_host_values, readout_values.p,
+                                       n * kMaximumReadoutTokens * sizeof(float),
+                                       cudaMemcpyDeviceToHost, stream));
+        }
         {
             auto scope = sample_workspace->scope();
             ops::sample(logits, sampled, static_cast<std::int32_t>(domain), device_configs,
@@ -1564,6 +1717,11 @@ struct Qwen4ExpCore::Impl {
                 record.top_values[k]   = host_values[slot];
                 if (host_ids[slot] == token) { record.logprob = host_values[slot]; }
             }
+            if (rows[b].readout != nullptr) {
+                record.readout_count = static_cast<std::uint32_t>(rows[b].readout->size());
+                std::copy_n(readout_host_values + b * kMaximumReadoutTokens, record.readout_count,
+                            record.readout_values.begin());
+            }
         }
     }
 
@@ -1572,13 +1730,16 @@ struct Qwen4ExpCore::Impl {
         if (!r.post_thinking && exec.post_thinking_sampling && r.output.reasoning_closed()) {
             r.post_thinking = true;
         }
-        return SampleRow{.params   = r.post_thinking ? &*exec.post_thinking_sampling
-                                                     : &exec.sampling,
+        return SampleRow{.params = r.post_thinking ? &*exec.post_thinking_sampling : &exec.sampling,
                          .position = r.position,
                          .slot     = r.slot,
                          .counts   = r.penalties,
                          .logprobs = exec.logprobs,
-                         .mask     = r.mask ? r.mask->masks() : nullptr};
+                         .mask     = r.mask ? r.mask->masks() : nullptr,
+                         .readout  = exec.logprobs && !exec.readout_tokens.empty() &&
+                                             r.first_token == Clock::time_point{}
+                                         ? &exec.readout_tokens
+                                         : nullptr};
     }
 
     // Frees the request's sequence (keeping its state for the context cache) and completes it.
@@ -1606,6 +1767,7 @@ struct Qwen4ExpCore::Impl {
         result.thinking.post_thinking_sampling = r.post_thinking;
         result.reused_prompt_tokens            = r.reused;
         result.prefix_reuse_path               = r.reuse_path;
+        result.branches                        = std::move(r.branch_results);
         if (drafts > 0) { result.speculative = r.speculative; }
         result.timings.prepare_seconds         = r.prepare_seconds;
         result.timings.vision_seconds          = r.vision_seconds;
@@ -1644,6 +1806,29 @@ struct Qwen4ExpCore::Impl {
             finish_now(request, FinishReason::Cancelled);
             return;
         }
+        // A prompt admitted with nothing to resume may find a prefix another request stored while
+        // it waited (the shared state of reads that arrived together): start there.
+        if (reuse_prefixes && r.reusable && r.prefilled == 0) {
+            const auto [image, from_store] =
+                find_stored(r.prompt_tokens, drafts_for(r), r.branches != nullptr);
+            if (from_store > 0) {
+                const std::vector<TokenId> tokens = stored[image].tokens;
+                const PrefixReusePath path        = stored[image].path;
+                if (restore_stored(r.slot, tokens)) {
+                    slot.fed = tokens;
+                    slot.anchor.clear();
+                    r.reuse_path = path;
+                    r.reused = r.prefilled = from_store;
+                    skip_drafter(r);
+                    std::lock_guard lock(stats_mutex);
+                    stats.reused_prompt_tokens += from_store;
+                }
+            }
+        }
+        if (r.branches && r.prefilled == prompt_n) {
+            branch_step(request);
+            return;
+        }
         if (r.media && r.prefilled == 0) {
             // The tower's embeddings stay until another prompt's media replace them; prompts
             // prefill one at a time, so this one is done first.
@@ -1661,6 +1846,10 @@ struct Qwen4ExpCore::Impl {
             r.vision_seconds = seconds(vision_start, Clock::now());
         }
         const std::uint32_t n = prompt_step_tokens(r);
+        if (opens_branches(r, n)) {
+            prompt_branch_pass(request, n);
+            return;
+        }
         const auto prompt     = std::span<const TokenId>(r.prompt_tokens);
         const auto chunk      = prompt.subspan(r.prefilled, n);
         // The next step's table rows are read while this one runs.
@@ -1669,22 +1858,214 @@ struct Qwen4ExpCore::Impl {
         executor.forward(r.slot, chunk, 1, next);
         slot.fed.insert(slot.fed.end(), chunk.begin(), chunk.end());
         r.prefilled += n;
+        if (reuse_prefixes && r.reusable &&
+            std::binary_search(r.shared_at.begin(), r.shared_at.end(), r.prefilled)) {
+            store_image(r.slot, slot.fed, nullptr, PrefixReusePath::SharedStablePrefix);
+        }
         if (reuse_prefixes && r.reusable && r.prefilled == r.anchor_at) {
             executor.snapshot(r.slot, slot.snapshot);
             slot.anchor = slot.fed;
         }
         if (r.observation.prompt_progress) {
             CUDA_CHECK(cudaStreamSynchronize(executor.head_stream()));
-            {
-                std::lock_guard lock(r.mutex);
-                r.stream_progress = PromptProgress{.total_prompt_tokens     = prompt_n,
-                                                   .reused_prompt_tokens    = r.reused,
-                                                   .processed_prompt_tokens = r.prefilled,
-                                                   .elapsed_ns = elapsed_ns(r.admitted, Clock::now())};
-            }
-            r.cv.notify_all();
+            observe_prompt(r);
         }
         if (r.prefilled < prompt_n) { return; }
+        if (r.branches) { return; } // the next steps run the branches
+        finish_prompt(request);
+    }
+
+    // One step of a branched read: the current branch's next tokens, from the snapshot at the
+    // prompt's end when the branch begins, and once they are in, its first token read. When the
+    // last branch is read, the request publishes the first branch's token and finishes.
+    void branch_step(const std::shared_ptr<Request>& request) {
+        Request& r                        = *request;
+        Slot& slot                        = slots[r.slot];
+        auto& executor                    = *instance.executor;
+        const auto prompt_n               = static_cast<std::uint32_t>(r.prompt_tokens.size());
+        const runtime::ReadBranch& branch = (*r.branches)[r.branch_results.size()];
+        // Branches that fit a prompt chunk run in shared passes (branch_pass); a longer one runs
+        // alone, chunk by chunk.
+        const bool shared = r.branch_fed == 0 && executor.runs_branches() &&
+                            branch.tokens.size() <= executor.options().prefill_chunk;
+        // A branch starts from the state at the prompt's end: the sequence's own at the first
+        // branch, kept in its snapshot (the anchor) for the others; a shared pass restores it.
+        if (r.branch_fed == 0) {
+            if (slot.fed == r.prompt_tokens) {
+                if (slot.anchor != slot.fed) {
+                    executor.snapshot(r.slot, slot.snapshot);
+                    slot.anchor = slot.fed;
+                }
+            } else {
+                if (slot.anchor != r.prompt_tokens) {
+                    throw std::logic_error("a branched read lost the state at its prompt's end");
+                }
+                if (!shared) {
+                    executor.restore(r.slot, slot.snapshot);
+                    slot.fed = slot.anchor;
+                }
+            }
+        }
+        if (shared) {
+            branch_pass(request);
+            return;
+        }
+        const std::uint32_t n = prompt_step_tokens(r);
+        const auto chunk      = std::span<const TokenId>(branch.tokens).subspan(r.branch_fed, n);
+        executor.forward(r.slot, chunk, 1);
+        slot.fed.insert(slot.fed.end(), chunk.begin(), chunk.end());
+        r.branch_fed += n;
+        r.progress = Clock::now();
+        if (r.branch_fed < branch.tokens.size()) { return; }
+        SampleRow row = sample_row(r);
+        row.readout   = branch.readout_tokens.empty() ? nullptr : &branch.readout_tokens;
+        TokenId token = 0;
+        runtime::RawTokenLogprob record;
+        sample(std::span(&row, 1), ops::kSamplePurposePrefill, std::span(&token, 1),
+               std::span(&record, 1));
+        if (r.branch_results.empty()) {
+            r.branch_token  = token;
+            r.branch_record = record;
+        }
+        r.branch_results.push_back(BranchResult{
+            .prompt_tokens = prompt_n + static_cast<std::uint32_t>(branch.tokens.size()),
+            .first         = instance.frontend.token_logprob(record)});
+        r.branch_fed = 0;
+        if (r.branch_results.size() < r.branches->size()) { return; }
+        finish_prompt(request);
+    }
+
+    // Publishes how much of the prompt is in to a request that observes its progress.
+    void observe_prompt(Request& r) {
+        {
+            std::lock_guard lock(r.mutex);
+            r.stream_progress = PromptProgress{
+                .total_prompt_tokens     = static_cast<std::uint32_t>(r.prompt_tokens.size()),
+                .reused_prompt_tokens    = r.reused,
+                .processed_prompt_tokens = r.prefilled,
+                .elapsed_ns              = elapsed_ns(r.admitted, Clock::now())};
+        }
+        r.cv.notify_all();
+    }
+
+    // Whether a branched read's prompt step of `n` tokens is its last and its first branch fits
+    // the chunk beside it, so the step and the branches run in one pass (prompt_branch_pass). A
+    // media prompt prefills in passes of its own.
+    [[nodiscard]] bool opens_branches(const Request& r, std::uint32_t n) const {
+        const auto& executor = *instance.executor;
+        const auto prompt_n  = static_cast<std::uint32_t>(r.prompt_tokens.size());
+        return r.branches && !r.media && executor.runs_branches() && n > 0 &&
+               r.prefilled + n == prompt_n &&
+               n + (*r.branches)[0].tokens.size() <= executor.options().prefill_chunk;
+    }
+
+    // Appends the next branches of a branched read from `first` to `tokens` while they fit one
+    // prompt chunk beside what it holds and their rows the logits; their lengths, in order.
+    [[nodiscard]] std::vector<std::uint32_t> pack_branches(const Request& r, std::size_t first,
+                                                           std::vector<TokenId>& tokens) const {
+        const auto& executor                             = *instance.executor;
+        const std::vector<runtime::ReadBranch>& branches = *r.branches;
+        const std::size_t room                           = executor.options().prefill_chunk;
+        const std::size_t rows                           = executor.max_logit_rows();
+        std::vector<std::uint32_t> lengths;
+        for (std::size_t b = first; b < branches.size() && lengths.size() < rows &&
+                                    tokens.size() + branches[b].tokens.size() <= room;
+             ++b) {
+            tokens.insert(tokens.end(), branches[b].tokens.begin(), branches[b].tokens.end());
+            lengths.push_back(static_cast<std::uint32_t>(branches[b].tokens.size()));
+        }
+        return lengths;
+    }
+
+    // A branched read's last prompt step and its first branches in one pass
+    // (Executor::forward_prompt_branches): the state at the prompt's end goes to the slot's
+    // snapshot, the anchor the later branches start from, as the pass reaches it, and each layer's
+    // experts cross the bus once for the prompt's tokens and the branches'.
+    void prompt_branch_pass(const std::shared_ptr<Request>& request, std::uint32_t n) {
+        Request& r          = *request;
+        Slot& slot          = slots[r.slot];
+        auto& executor      = *instance.executor;
+        const auto prompt_n = static_cast<std::uint32_t>(r.prompt_tokens.size());
+        const auto chunk    = std::span<const TokenId>(r.prompt_tokens).subspan(r.prefilled, n);
+        std::vector<TokenId> tokens(chunk.begin(), chunk.end());
+        const std::vector<std::uint32_t> lengths = pack_branches(r, 0, tokens);
+        executor.forward_prompt_branches(r.slot, n, slot.snapshot, tokens, lengths);
+        r.prefilled = prompt_n;
+        slot.fed.assign(r.prompt_tokens.begin(), r.prompt_tokens.end());
+        slot.anchor = slot.fed;
+        if (reuse_prefixes && r.reusable &&
+            std::binary_search(r.shared_at.begin(), r.shared_at.end(), prompt_n)) {
+            store_image(r.slot, slot.anchor, &slot.snapshot, PrefixReusePath::SharedStablePrefix);
+        }
+        // The pass waited for its copies, so the prompt is in.
+        if (r.observation.prompt_progress) { observe_prompt(r); }
+        const std::vector<TokenId>& last = (*r.branches)[lengths.size() - 1].tokens;
+        slot.fed.insert(slot.fed.end(), last.begin(), last.end());
+        read_branches(request, lengths);
+    }
+
+    // The next branches of a branched read that fit one prompt chunk together, from the snapshot
+    // at the prompt's end in one pass (Executor::forward_branches): each layer's experts cross the
+    // bus once for all of them.
+    void branch_pass(const std::shared_ptr<Request>& request) {
+        Request& r              = *request;
+        Slot& slot              = slots[r.slot];
+        auto& executor          = *instance.executor;
+        const std::size_t first = r.branch_results.size();
+        std::vector<TokenId> tokens;
+        const std::vector<std::uint32_t> lengths = pack_branches(r, first, tokens);
+        executor.forward_branches(r.slot, slot.snapshot, tokens, lengths);
+        const std::vector<TokenId>& last = (*r.branches)[first + lengths.size() - 1].tokens;
+        slot.fed.assign(r.prompt_tokens.begin(), r.prompt_tokens.end());
+        slot.fed.insert(slot.fed.end(), last.begin(), last.end());
+        read_branches(request, lengths);
+    }
+
+    // The first tokens of the branches a pass just ran (`lengths`, after those already read), a
+    // lane's worth of logit rows at a time; once the last branch is read, the prompt is in.
+    void read_branches(const std::shared_ptr<Request>& request,
+                       std::span<const std::uint32_t> lengths) {
+        Request& r          = *request;
+        auto& executor      = *instance.executor;
+        const auto prompt_n = static_cast<std::uint32_t>(r.prompt_tokens.size());
+        const std::vector<runtime::ReadBranch>& branches = *r.branches;
+        const std::size_t first                          = r.branch_results.size();
+        r.progress              = Clock::now();
+        const Tensor logits     = executor.logits(static_cast<std::uint32_t>(lengths.size()));
+        const std::size_t width = slots.size();
+        for (std::size_t at = 0; at < lengths.size(); at += width) {
+            const std::size_t n = std::min(width, lengths.size() - at);
+            std::vector<SampleRow> rows(n, sample_row(r));
+            for (std::size_t k = 0; k < n; ++k) {
+                const runtime::ReadBranch& branch = branches[first + at + k];
+                rows[k].readout = branch.readout_tokens.empty() ? nullptr : &branch.readout_tokens;
+            }
+            std::vector<TokenId> sampled(n);
+            std::vector<runtime::RawTokenLogprob> records(n);
+            const Tensor source =
+                logits.slice(1, static_cast<std::int32_t>(at), static_cast<std::int32_t>(n));
+            sample(rows, ops::kSamplePurposePrefill, sampled, records, &source);
+            for (std::size_t k = 0; k < n; ++k) {
+                if (r.branch_results.empty()) {
+                    r.branch_token  = sampled[k];
+                    r.branch_record = records[k];
+                }
+                const auto own = static_cast<std::uint32_t>(branches[first + at + k].tokens.size());
+                r.branch_results.push_back(
+                    BranchResult{.prompt_tokens = prompt_n + own,
+                                 .first         = instance.frontend.token_logprob(records[k])});
+            }
+        }
+        if (r.branch_results.size() < branches.size()) { return; }
+        finish_prompt(request);
+    }
+
+    // The prompt is in (and a branched read's branches): the request takes its first token and
+    // decodes from there.
+    void finish_prompt(const std::shared_ptr<Request>& request) {
+        Request& r          = *request;
+        auto& executor      = *instance.executor;
+        const auto prompt_n = static_cast<std::uint32_t>(r.prompt_tokens.size());
         CUDA_CHECK(cudaStreamSynchronize(executor.head_stream()));
         r.prefill_end = Clock::now();
         {
@@ -1715,6 +2096,10 @@ struct Qwen4ExpCore::Impl {
         r.progress         = Clock::now();
         // The first token's mask began with the request; when it is not done yet, the prompt's
         // last logits wait for it instead of the worker.
+        if (r.branches) {
+            accept(request, r.branch_token, &r.branch_record);
+            return;
+        }
         if (!mask_ready(r)) {
             defer_sample(r, executor.logits(1), 0, ops::kSamplePurposePrefill);
             return;
@@ -2033,6 +2418,7 @@ struct Qwen4ExpCore::Impl {
         // only, and no row when all have a proposal.
         std::vector<char> looked_up(b, 0);
         std::size_t lookups = 0;
+        std::uint32_t mtp_steps = 0;
         if (lookup_ngram != 0) {
             for (std::size_t j = 0; j < b; ++j) {
                 std::vector<TokenId>& ledger = slots[batch[j]->slot].fed;
@@ -2057,7 +2443,7 @@ struct Qwen4ExpCore::Impl {
             }
             std::vector<TokenId> mtp_drafts(mtp_sequences.size() * drafts);
             std::vector<std::uint32_t> mtp_extents(mtp_sequences.size(), steps);
-            executor.draft(mtp_sequences, mtp_anchors, mtp_drafts, mtp_extents, steps);
+            mtp_steps = executor.draft(mtp_sequences, mtp_anchors, mtp_drafts, mtp_extents, steps);
             for (std::size_t j = 0, m = 0; j < b; ++j) {
                 if (looked_up[j]) { continue; }
                 std::copy_n(mtp_drafts.begin() + std::ptrdiff_t(m * drafts), drafts,
@@ -2065,7 +2451,24 @@ struct Qwen4ExpCore::Impl {
                 draft_extents[j] = mtp_extents[m++];
             }
         }
-        const std::size_t k = *std::max_element(draft_extents.begin(), draft_extents.end());
+        // Each row verifies the drafts its output/thinking budget leaves room for (the correction
+        // takes one more token); with --adaptive-mtp the plan keeps the extents worth their rows.
+        for (std::size_t j = 0; j < b; ++j) {
+            const auto remaining = batch[j]->output.model_token_budget_remaining(
+                batch[j]->budget->remaining());
+            draft_extents[j] =
+                static_cast<std::uint32_t>(std::min<std::size_t>(draft_extents[j], remaining - 1));
+        }
+        if (mtp_controller) {
+            std::vector<const runtime::MtpAdaptiveSignal*> signals;
+            for (std::size_t j = 0; j < b; ++j) {
+                signals.push_back(looked_up[j] ? nullptr : &batch[j]->mtp_signal);
+            }
+            const std::vector<std::uint32_t> limits = draft_extents;
+            packed_planner.plan(signals, limits, draft_extents);
+        }
+        const std::size_t k = std::max<std::size_t>(
+            1, *std::max_element(draft_extents.begin(), draft_extents.end()));
         const std::size_t w = k + 1;
         const auto columns = static_cast<std::int32_t>(w);
         std::vector<TokenId> proposed;
@@ -2074,12 +2477,23 @@ struct Qwen4ExpCore::Impl {
             proposed.insert(proposed.end(), all_drafts.begin() + std::ptrdiff_t(j * drafts),
                             all_drafts.begin() + std::ptrdiff_t(j * drafts + k));
         }
+        // The rows are packed at their own widths, no row verifying columns it cannot take; a row
+        // that gathers logprobs keeps every row at the round's width, the layout their gather reads.
+        const bool packed = std::none_of(batch.begin(), batch.end(), [](const auto& request) {
+            return request->options.execution.logprobs;
+        });
+        std::vector<std::uint32_t> widths(b);
+        std::vector<std::int32_t> starts(b);
         std::vector<TokenId> tokens;
         for (std::size_t j = 0; j < b; ++j) {
+            const std::size_t own = packed ? draft_extents[j] : k;
+            starts[j]             = static_cast<std::int32_t>(tokens.size());
+            widths[j]             = static_cast<std::uint32_t>(own + 1);
             tokens.push_back(anchors[j]);
             tokens.insert(tokens.end(), proposed.begin() + std::ptrdiff_t(j * k),
-                          proposed.begin() + std::ptrdiff_t((j + 1) * k));
+                          proposed.begin() + std::ptrdiff_t(j * k + own));
         }
+        const auto verified_columns = static_cast<std::int32_t>(tokens.size());
         // A structured row's masks, one per column after its own drafts, fill in parallel while
         // the verification runs.
         std::vector<std::shared_ptr<runtime::GrammarMaskJob>> column_masks(b);
@@ -2091,7 +2505,7 @@ struct Qwen4ExpCore::Impl {
                 std::vector<TokenId>(proposed.begin() + std::ptrdiff_t(j * k),
                                      proposed.begin() + std::ptrdiff_t(j * k + own)));
         }
-        executor.verify(sequences, tokens);
+        executor.verify(sequences, tokens, widths);
 
         RankBinding bind(device, executor.head_rank());
         const cudaStream_t stream = executor.head_stream();
@@ -2144,22 +2558,22 @@ struct Qwen4ExpCore::Impl {
         auto* staged = static_cast<std::int32_t*>(host_spec->data());
         std::copy(proposed.begin(), proposed.end(), staged);
         for (std::size_t j = 0; j < b; ++j) {
-            // The batch uses its largest confidence prefix. Acceptance also respects each
-            // sequence's shorter prefix and its output/thinking budget, including correction.
-            const auto remaining = batch[j]->output.model_token_budget_remaining(
-                batch[j]->budget->remaining());
-            staged[b * k + j] = static_cast<std::int32_t>(
-                std::min<std::size_t>(draft_extents[j], remaining - 1));
+            staged[b * k + j]     = static_cast<std::int32_t>(draft_extents[j]);
             staged[b * k + b + j] = static_cast<std::int32_t>(batch[j]->position);
         }
+        // Past the licensed run (b * (k + 2) + b * w + 2 * b): the rows' first columns.
+        auto* staged_starts = staged + b * (k + 4) + b * w;
+        std::copy(starts.begin(), starts.end(), staged_starts);
         CUDA_CHECK(
             cudaMemcpyAsync(spec_drafts.p, staged, b * k * 4, cudaMemcpyHostToDevice, stream));
         CUDA_CHECK(
             cudaMemcpyAsync(spec_extents.p, staged + b * k, b * 4, cudaMemcpyHostToDevice, stream));
         CUDA_CHECK(cudaMemcpyAsync(spec_lengths.p, staged + b * k + b, b * 4,
                                    cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(spec_columns.p, staged_starts, b * 4, cudaMemcpyHostToDevice,
+                                   stream));
         const auto rows_n         = static_cast<std::int32_t>(b);
-        const Tensor logits       = executor.logits(static_cast<std::uint32_t>(b * w));
+        const Tensor logits       = executor.logits(static_cast<std::uint32_t>(verified_columns));
         const auto* device_config = static_cast<const ops::SamplingConfig*>(sample_config.p);
         const Tensor drafted(spec_drafts.p, DType::I32, {static_cast<std::int32_t>(k), rows_n});
         // The tokens' logprob records, from the distributions their columns are drawn from,
@@ -2191,7 +2605,7 @@ struct Qwen4ExpCore::Impl {
                                        std::size_t(domain) * sizeof(std::int32_t),
                                        cudaMemcpyDeviceToDevice, stream));
         }
-        Tensor targets(spec_targets.p, DType::I32, {columns * rows_n});
+        Tensor targets(spec_targets.p, DType::I32, {verified_columns});
         ops::argmax(logits, targets, static_cast<std::int32_t>(domain), stream);
         Tensor extents(spec_extents.p, DType::I32, {rows_n});
         Tensor lengths(spec_lengths.p, DType::I32, {rows_n});
@@ -2201,10 +2615,11 @@ struct Qwen4ExpCore::Impl {
         Tensor accepted(spec_accepted.p, DType::I32, {rows_n});
         {
             auto scope = sample_workspace->scope();
+            const Tensor column_starts(spec_columns.p, DType::I32, {rows_n});
             ops::speculative_accept_coupled_drafts(
-                targets.view({columns, rows_n}), logits.view({logits.ne[0], columns, rows_n}),
-                drafted, extents, lengths, round_anchors, licensed, counts, accepted,
-                static_cast<std::int32_t>(domain), device_config, *sample_workspace, stream);
+                targets, logits, drafted, extents, lengths, round_anchors, licensed, counts,
+                accepted, static_cast<std::int32_t>(domain), device_config, *sample_workspace,
+                stream, &column_starts);
         }
         auto* host = staged + b * (k + 2);
         CUDA_CHECK(
@@ -2249,8 +2664,8 @@ struct Qwen4ExpCore::Impl {
                 }
             }
             r.speculative.rounds += 1;
-            // The MTP draft chain runs all its steps; a lookup proposes what it found.
-            r.speculative.drafted_tokens += looked_up[j] ? draft_extents[j] : steps;
+            // The MTP draft chain's steps run for the round; a lookup proposes what it found.
+            r.speculative.drafted_tokens += looked_up[j] ? draft_extents[j] : mtp_steps;
             r.speculative.accepted_tokens += std::uint32_t(drafts_n);
             if (looked_up[j]) {
                 // Reported with the n-gram proposals: what the context, not the model, proposed.
@@ -2300,17 +2715,22 @@ struct Qwen4ExpCore::Impl {
         }
         executor.commit(sequences, kept);
         // The controller measures rounds of MTP drafts only: a lookup changes the round's width.
-        if (mtp_controller && lookups == 0) {
-            mtp_controller->observe_execution(static_cast<std::uint32_t>(b), steps,
-                                              seconds(round_start, Clock::now()));
+        // The plan prices the rows verified, whatever proposed them.
+        if (mtp_controller) {
+            const double round_seconds = seconds(round_start, Clock::now());
+            if (lookups == 0) {
+                mtp_controller->observe_execution(static_cast<std::uint32_t>(b), steps,
+                                                  round_seconds);
+            }
+            packed_planner.observe(static_cast<std::uint32_t>(verified_columns), round_seconds);
         }
         for (std::size_t j = 0; j < b; ++j) {
             Request& r = *batch[j];
             if (failed[j]) { continue; } // its sequence keeps nothing for the context cache
             Slot& slot = slots[r.slot];
             // The verification fed the anchor and the drafts; the sequence keeps the first ones.
-            slot.fed.insert(slot.fed.end(), tokens.begin() + std::ptrdiff_t(j * w),
-                            tokens.begin() + std::ptrdiff_t(j * w + kept[j]));
+            slot.fed.insert(slot.fed.end(), tokens.begin() + starts[j],
+                            tokens.begin() + starts[j] + std::ptrdiff_t(kept[j]));
             r.position += kept[j];
             try {
                 check_capacity(batch[j]);
@@ -2468,13 +2888,38 @@ void Qwen4ExpCore::stop() noexcept {
     impl_->queue_cv.notify_all();
 }
 
-Qwen4ExpCore::Submission Qwen4ExpCore::submit(models::qwen3_5::PreparedPrompt prompt,
-                                              PromptSummary prompt_summary, double prepare_seconds,
-                                              ResolvedRequestOptions options,
-                                              OutputConsumerMode consumer_mode,
-                                              GenerationObservationOptions observation,
-                                              Clock::time_point pending_deadline) {
-    const auto submitted = Clock::now();
+std::shared_ptr<Qwen4ExpCore::Request>
+Qwen4ExpCore::make_request(GroupMember& member, std::optional<std::uint32_t>& budget_out) {
+    models::qwen3_5::PreparedPrompt& prompt         = member.prompt;
+    const PromptSummary& prompt_summary             = member.prompt_summary;
+    const double prepare_seconds                    = member.prepare_seconds;
+    ResolvedRequestOptions& options                 = member.options;
+    const OutputConsumerMode consumer_mode          = member.consumer_mode;
+    const GenerationObservationOptions& observation = member.observation;
+    Clock::time_point& pending_deadline             = member.pending_deadline;
+    const auto submitted                            = Clock::now();
+    for (const TokenId id : options.execution.readout_tokens) {
+        if (id < 0 || static_cast<std::uint32_t>(id) >= impl_->domain) {
+            throw std::invalid_argument("readout token is outside the public token domain");
+        }
+    }
+    if (const auto& branches = options.execution.branches) {
+        if (branches->empty() || options.execution.grammar ||
+            prompt.token_ids().size() + 1 > impl_->max_context) {
+            throw std::invalid_argument("a branched read needs branches and a text prompt");
+        }
+        for (const runtime::ReadBranch& branch : *branches) {
+            if (branch.tokens.empty() ||
+                prompt.token_ids().size() + branch.tokens.size() > impl_->max_context) {
+                throw std::invalid_argument("a branch needs tokens within the context");
+            }
+            for (const TokenId id : branch.readout_tokens) {
+                if (id < 0 || static_cast<std::uint32_t>(id) >= impl_->domain) {
+                    throw std::invalid_argument("readout token is outside the public token domain");
+                }
+            }
+        }
+    }
     if (options.execution.structured_output.kind != StructuredOutputKind::None &&
         !impl_->structured_output) {
         throw std::invalid_argument(
@@ -2489,6 +2934,9 @@ Qwen4ExpCore::Submission Qwen4ExpCore::submit(models::qwen3_5::PreparedPrompt pr
     {
         const auto& data     = models::qwen3_5::PreparedPromptAccess::view(prompt);
         const auto& identity = data.identity;
+        if (options.execution.branches && data.has_media()) {
+            throw std::invalid_argument("a branched read needs a text prompt");
+        }
         const auto prompt_n  = static_cast<std::uint32_t>(request->prompt_tokens.size());
         request->media       = data.has_media();
         if (request->media && !impl_->instance.executor->vision()) {
@@ -2504,6 +2952,29 @@ Qwen4ExpCore::Submission Qwen4ExpCore::submit(models::qwen3_5::PreparedPrompt pr
             identity.rewrite_checkpoint->frontier < prompt_n) {
             request->anchor_at = identity.rewrite_checkpoint->frontier;
         }
+        request->disposable = data.tap_hints.disposable;
+        // Shared prefixes worth an image of their own: a structural or declared boundary, not one
+        // the engine merely observed (the prompt's end, a grid point). A branched read's prompt
+        // ends at its declared boundary, the state its branches and the next reads of that state
+        // resume from.
+        const std::uint32_t shared_end =
+            options.execution.branches ? prompt_n + 1 : request->anchor_at;
+        for (const auto& opportunity : data.context_cache.opportunities) {
+            const bool structural = has_shared_candidate_evidence(
+                opportunity.evidence, SharedCandidateEvidence::ExplicitBoundary |
+                                          SharedCandidateEvidence::RequestedAutomatic |
+                                          SharedCandidateEvidence::DefaultAutomatic |
+                                          SharedCandidateEvidence::EngineStructural);
+            const std::uint32_t frontier = opportunity.frontier;
+            if (request->reusable &&
+                opportunity.kind == PromptCacheMarkerKind::SharedStablePrefix && structural &&
+                frontier >= Impl::kMinStoredTokens && frontier < shared_end) {
+                request->shared_at.push_back(frontier);
+            }
+        }
+        std::sort(request->shared_at.begin(), request->shared_at.end());
+        request->shared_at.erase(std::unique(request->shared_at.begin(), request->shared_at.end()),
+                                 request->shared_at.end());
     }
     request->prompt_summary  = prompt_summary;
     request->prepare_seconds = prepare_seconds;
@@ -2527,21 +2998,58 @@ Qwen4ExpCore::Submission Qwen4ExpCore::submit(models::qwen3_5::PreparedPrompt pr
     const std::optional<std::uint32_t> budget = request->output.thinking_stats().effective_budget;
     request->prompt                           = std::move(prompt);
     request->options                          = std::move(options);
+    request->branches                         = request->options.execution.branches;
+    budget_out                                = budget;
+    return request;
+}
+
+Qwen4ExpCore::Submission Qwen4ExpCore::submit(models::qwen3_5::PreparedPrompt prompt,
+                                              PromptSummary prompt_summary, double prepare_seconds,
+                                              ResolvedRequestOptions options,
+                                              OutputConsumerMode consumer_mode,
+                                              GenerationObservationOptions observation,
+                                              Clock::time_point pending_deadline) {
+    std::vector<GroupMember> one;
+    one.push_back(GroupMember{.prompt           = std::move(prompt),
+                              .prompt_summary   = prompt_summary,
+                              .prepare_seconds  = prepare_seconds,
+                              .options          = std::move(options),
+                              .consumer_mode    = consumer_mode,
+                              .observation      = observation,
+                              .pending_deadline = pending_deadline});
+    return std::move(submit_group(std::move(one)).front());
+}
+
+std::vector<Qwen4ExpCore::Submission> Qwen4ExpCore::submit_group(std::vector<GroupMember> group) {
+    std::vector<std::shared_ptr<Request>> requests;
+    std::vector<std::optional<std::uint32_t>> budgets(group.size());
+    requests.reserve(group.size());
+    for (std::size_t k = 0; k < group.size(); ++k) {
+        requests.push_back(make_request(group[k], budgets[k]));
+    }
+    if (requests.empty()) { return {}; }
     {
         std::lock_guard lock(impl_->queue_mutex);
         if (impl_->stopping || impl_->failed) {
             throw RequestError(RequestErrorKind::Unavailable, "inference engine is unavailable");
         }
-        if (impl_->outstanding >= impl_->max_outstanding) {
+        if (impl_->outstanding + requests.size() > impl_->max_outstanding) {
             throw RequestError(RequestErrorKind::Overloaded, "inference request queue is full");
         }
-        ++impl_->outstanding;
-        request->id = impl_->next_id++;
-        impl_->pending.push_back(request);
+        impl_->outstanding += requests.size();
+        for (const auto& request : requests) {
+            request->id = impl_->next_id++;
+            impl_->pending.push_back(request);
+        }
     }
     impl_->queue_cv.notify_one();
     impl_->publish_queue();
-    return Submission(*this, std::move(request), budget);
+    std::vector<Submission> submissions;
+    submissions.reserve(requests.size());
+    for (std::size_t k = 0; k < requests.size(); ++k) {
+        submissions.push_back(Submission(*this, std::move(requests[k]), budgets[k]));
+    }
+    return submissions;
 }
 
 std::vector<float> Qwen4ExpCore::score(models::qwen3_5::PreparedPrompt prompt,

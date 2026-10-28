@@ -1,6 +1,7 @@
 #pragma once
 
-#include "ninfer/types.h"
+#include "ninfer/engine_options.h"
+#include "ninfer/model_enums.h"
 
 #include <cmath>
 #include <stdexcept>
@@ -14,6 +15,7 @@ namespace ninfer::product {
     if (value == "mtp") { return SpeculativeBackend::Mtp; }
     if (value == "dflash") { return SpeculativeBackend::DFlash; }
     if (value == "dflash2") { return SpeculativeBackend::DFlash2; }
+    if (value == "dspark") { return SpeculativeBackend::DSpark; }
     throw std::invalid_argument("invalid speculative backend: " + std::string(value));
 }
 
@@ -27,17 +29,21 @@ namespace ninfer::product {
         return "dflash";
     case SpeculativeBackend::DFlash2:
         return "dflash2";
+    case SpeculativeBackend::DSpark:
+        return "dspark";
     }
     return "unknown";
 }
 
-// Copy drafting rides along with every drafter unless the command line sets its width. Fifteen
-// drafts is the widest a multi-request batch verifies, so the default holds at any concurrency.
+// Copy drafting rides along with every drafter but DSpark unless the command line sets its width.
+// Fifteen drafts is the widest a multi-request batch verifies, so the default holds at any
+// concurrency.
 inline constexpr std::uint32_t kDefaultNgramDraftTokens = 15;
 
 inline void apply_default_ngram_draft_tokens(SpeculativeOptions& options,
                                              bool width_explicit) noexcept {
-    if (!width_explicit && options.backend != SpeculativeBackend::None) {
+    if (!width_explicit && options.backend != SpeculativeBackend::None &&
+        options.backend != SpeculativeBackend::DSpark) {
         options.ngram_draft_tokens = kDefaultNgramDraftTokens;
     }
 }
@@ -54,6 +60,12 @@ inline void validate_speculative_cli_options(const SpeculativeOptions& options) 
         options.draft_min_p > 1 ||
         (options.draft_min_p != 0 && options.backend != SpeculativeBackend::Mtp)) {
         throw std::invalid_argument("--draft-min-p requires --spec mtp and a finite value in [0,1]");
+    }
+    if (options.draft_confidence &&
+        (!std::isfinite(*options.draft_confidence) || *options.draft_confidence < 0 ||
+         *options.draft_confidence > 1 || options.backend != SpeculativeBackend::DSpark)) {
+        throw std::invalid_argument(
+            "--draft-confidence requires --spec dspark and a finite value in [0,1]");
     }
     if (options.ngram_archive_bytes != 0 &&
         (options.ngram_draft_tokens == 0 || options.ngram_session_bytes < (1ULL << 20) ||
@@ -80,7 +92,7 @@ inline void validate_speculative_cli_options(const SpeculativeOptions& options) 
     case SpeculativeBackend::None:
         if (options.draft_tokens != 0 || options.proposal_head != ProposalHead::Auto) {
             throw std::invalid_argument("--draft-tokens, --lm-head-draft and --full-draft-head "
-                                        "require --spec mtp|dflash|dflash2");
+                                        "require --spec mtp|dflash|dflash2|dspark");
         }
         if (options.mtp_policy != MtpDraftPolicy::Fixed) {
             throw std::invalid_argument("--adaptive-mtp requires --spec mtp");
@@ -102,6 +114,16 @@ inline void validate_speculative_cli_options(const SpeculativeOptions& options) 
     case SpeculativeBackend::DFlash2:
         if (options.draft_tokens == 0 || options.draft_tokens > 15) {
             throw std::invalid_argument("--spec dflash2 requires --draft-tokens in [1,15]");
+        }
+        if (options.mtp_policy != MtpDraftPolicy::Fixed) {
+            throw std::invalid_argument("--adaptive-mtp requires --spec mtp");
+        }
+        return;
+    case SpeculativeBackend::DSpark:
+        // Without --draft-tokens a round verifies the drafter's whole block.
+        if (options.draft_tokens > 15 || options.proposal_head != ProposalHead::Auto) {
+            throw std::invalid_argument("--spec dspark takes --draft-tokens up to 15 and no "
+                                        "proposal head");
         }
         if (options.mtp_policy != MtpDraftPolicy::Fixed) {
             throw std::invalid_argument("--adaptive-mtp requires --spec mtp");

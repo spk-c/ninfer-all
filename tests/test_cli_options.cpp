@@ -69,6 +69,44 @@ int run_tests() {
         (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--draft-min-p", "0.3"});
     }), "CLI accepted draft confidence without MTP");
     {
+        // DeepSeek's DSpark drafter: its whole block without --draft-tokens, no copy drafts beside
+        // it unless asked, and neither a proposal head nor MTP's confidence floor.
+        const auto block = parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--spec", "dspark"});
+        const auto three = parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--spec", "dspark",
+                                  "--draft-tokens", "3"});
+        failures += check(block.speculative.backend == ninfer::SpeculativeBackend::DSpark &&
+                              block.speculative.draft_tokens == 0 &&
+                              block.speculative.ngram_draft_tokens == 0 &&
+                              three.speculative.draft_tokens == 3,
+                          "CLI did not preserve --spec dspark");
+        for (const std::vector<std::string> tail :
+             {std::vector<std::string>{"--lm-head-draft"}, {"--draft-min-p", "0.3"},
+              {"--draft-tokens", "16"}}) {
+            std::vector<std::string> args{"ninfer-cli", "model.ninfer", "--prompt", "x", "--spec", "dspark"};
+            args.insert(args.end(), tail.begin(), tail.end());
+            failures += check(rejects([&] { (void)parse(args); }),
+                              ("CLI accepted " + tail.front() + " beside --spec dspark").c_str());
+        }
+        // The confidence floor: the drafter's default unless set, 0..1, DSpark only.
+        failures += check(!block.speculative.draft_confidence, "DSpark's floor must default");
+        for (const auto* floor : {"0", "0.65", "1"}) {
+            const auto set = parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--spec",
+                                    "dspark", "--draft-confidence", floor});
+            failures += check(set.speculative.draft_confidence == std::stof(floor),
+                              "CLI did not preserve --draft-confidence");
+        }
+        for (const std::vector<std::string> tail :
+             {std::vector<std::string>{"--spec", "dspark", "--draft-confidence", "1.5"},
+              {"--spec", "dspark", "--draft-confidence", "nan"},
+              {"--spec", "mtp", "--draft-tokens", "4", "--draft-confidence", "0.5"},
+              {"--draft-confidence", "0.5"}}) {
+            std::vector<std::string> args{"ninfer-cli", "model.ninfer", "--prompt", "x"};
+            args.insert(args.end(), tail.begin(), tail.end());
+            failures += check(rejects([&] { (void)parse(args); }),
+                              "CLI accepted an invalid --draft-confidence");
+        }
+    }
+    {
         // Without --spec the Engine chooses; --spec none and every backend are explicit.
         const auto unset = parse({"ninfer-cli", "model.ninfer", "--prompt", "x"}).speculative;
         const auto none  = parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--spec", "none"}).speculative;
@@ -128,6 +166,17 @@ int run_tests() {
             (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--expert-cpu-threads", threads});
         }), "CLI accepted an invalid hybrid CPU worker count");
     }
+    failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "x"}).embedding_residency ==
+                              ninfer::EmbeddingResidency::Device &&
+                          parse({"ninfer-cli", "model.ninfer", "--prompt", "x",
+                                 "--embedding-residency", "host"})
+                                  .embedding_residency == ninfer::EmbeddingResidency::Host,
+                      "CLI did not default the embedding to the device or keep a host one");
+    failures += check(rejects([] {
+                          (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "x",
+                                       "--embedding-residency", "disk"});
+                      }),
+                      "CLI accepted an invalid embedding residency");
     failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--expert-residency",
                              "host"}).hybrid_experts.tail_skip_rank == 0 &&
                           parse({"ninfer-cli", "model.ninfer", "--prompt", "x",
@@ -342,6 +391,7 @@ int run_tests() {
                                         "--draft-tokens",
                                         "--embedding-q4",
                                         "--embedding-q6",
+                                        "--embedding-residency",
                                         "--frequency-penalty",
                                         "--full-draft-head",
                                         "--gdn-state-fp16",
@@ -480,6 +530,59 @@ int run_tests() {
                                        "--devices", "0,0", "--stage-layers", "0,64"});
                       }),
                       "a stage with no layers was accepted");
+    failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--devices", "0,1",
+                             "--tensor-parallel"})
+                          .tensor_parallel,
+                      "--tensor-parallel did not reach the options");
+    failures += check(!parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--devices", "0,1"})
+                           .tensor_parallel,
+                      "tensor parallelism is not off by default");
+    for (const std::vector<std::string>& devices :
+         {std::vector<std::string>{}, std::vector<std::string>{"--devices", "1"}}) {
+        failures += check(rejects([&] {
+                              std::vector<std::string> args{"ninfer-cli", "model.ninfer", "--prompt",
+                                                            "hello", "--tensor-parallel"};
+                              args.insert(args.end(), devices.begin(), devices.end());
+                              (void)parse(args);
+                          }),
+                          "--tensor-parallel without several devices was accepted");
+    }
+    failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--devices", "0,1",
+                             "--tensor-parallel", "--tensor-split", "3,1.5"})
+                              .tensor_split == std::vector<double>{3.0, 1.5},
+                      "--tensor-split did not reach the options");
+    for (const std::vector<std::string>& split :
+         {std::vector<std::string>{"--tensor-parallel", "--tensor-split", "1,2,3"},
+          std::vector<std::string>{"--tensor-split", "1,1"},
+          std::vector<std::string>{"--tensor-parallel", "--tensor-split", "1,0"},
+          std::vector<std::string>{"--tensor-parallel", "--tensor-split", "1,"},
+          std::vector<std::string>{"--tensor-parallel", "--tensor-split", "1,x"}}) {
+        failures += check(rejects([&] {
+                              std::vector<std::string> args{"ninfer-cli", "model.ninfer", "--prompt",
+                                                            "hello", "--devices", "0,1"};
+                              args.insert(args.end(), split.begin(), split.end());
+                              (void)parse(args);
+                          }),
+                          "a malformed or misplaced --tensor-split was accepted");
+    }
+    failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--devices", "0,1",
+                             "--tensor-parallel", "--tensor-attention", "positions"})
+                              .tensor_attention == ninfer::TensorAttention::Positions,
+                      "--tensor-attention did not reach the options");
+    failures += check(rejects([&] {
+                          (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
+                                       "--tensor-attention", "positions"});
+                      }),
+                      "--tensor-attention positions without --tensor-parallel was accepted");
+    failures += check(rejects([&] {
+                          (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--devices",
+                                       "0,1", "--tensor-parallel", "--tensor-attention", "rows"});
+                      }),
+                      "an unknown --tensor-attention mode was accepted");
+    failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
+                             "--invariant-attention"})
+                          .invariant_attention,
+                      "--invariant-attention did not reach the options");
     failures += check(parse({"ninfer", "model.ninfer", "--prompt", "x", "--spec", "mtp",
                              "--draft-tokens", "3", "--mtp-attention-window", "2048"})
                               .speculative.mtp_attention_window == 2048,
