@@ -2,7 +2,7 @@ add_library(ninfer_linear_test_support STATIC
   "${CMAKE_CURRENT_LIST_DIR}/linear_test_common.cpp")
 ninfer_test_includes(ninfer_linear_test_support)
 ninfer_op_oracle_options(ninfer_linear_test_support)
-target_link_libraries(ninfer_linear_test_support PUBLIC ninfer_ops)
+target_link_libraries(ninfer_linear_test_support PUBLIC ninfer_ops ninfer_artifact)
 
 ninfer_add_op_test(ninfer_linear_q4_a16_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_q4_a16.cpp"
@@ -18,6 +18,11 @@ ninfer_add_op_test(ninfer_linear_q6_a16_test
 
 ninfer_add_op_test(ninfer_linear_q8_a16_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_q8_a16.cpp"
+  LIBRARIES ninfer_linear_test_support)
+
+# A tensor-parallel share's projections: shapes outside the tuned tables, BF16 or FP32 out.
+ninfer_add_op_test(ninfer_linear_rowsplit_runtime_shape_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_rowsplit_runtime_shape.cpp"
   LIBRARIES ninfer_linear_test_support)
 
 ninfer_add_op_test(ninfer_linear_t2_a16_test
@@ -64,3 +69,24 @@ ninfer_add_op_test(ninfer_linear_gguf_test
   LIBRARIES ninfer_ops)
 target_include_directories(ninfer_linear_gguf_test PRIVATE
   "${PROJECT_SOURCE_DIR}/third_party/ggml-quants/src")
+
+ninfer_add_op_test(ninfer_linear_gguf_mmq_store_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gguf_mmq_store.cu"
+  LIBRARIES ninfer_ops)
+
+ninfer_add_op_test(ninfer_linear_gguf_mmq_limits_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gguf_mmq_limits.cpp")
+
+ninfer_add_op_test(ninfer_linear_gguf_cooperative_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gguf_cooperative.cu"
+  LIBRARIES ninfer_ops)
+
+target_include_directories(ninfer_linear_gguf_cooperative_test PRIVATE
+  "${PROJECT_SOURCE_DIR}/third_party/ggml-quants/include"
+  "${PROJECT_SOURCE_DIR}/third_party/ggml-quants/src")
+
+# STQ products (the sushi DSpark drafter's matrices) against an FP64 oracle over an independent
+# decode of the trellis.
+ninfer_add_op_test(ninfer_linear_stq_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_stq.cpp"
+  LIBRARIES ninfer_ops)
