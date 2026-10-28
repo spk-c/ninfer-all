@@ -2,7 +2,8 @@
 
 #include "product/media_acquire/source.h"
 
-#include <ninfer/types.h>
+#include "ninfer/base.h"
+#include "ninfer/request.h"
 
 // Internal, wire-format-independent representation of a generation request.
 //
@@ -286,6 +287,12 @@ struct GenerationRequest {
     // kMaximumTokenLogprobs) of its most likely alternatives in the response.
     bool logprobs    = false;
     int top_logprobs = 0;
+    // With logprobs: token ids whose exact log probabilities the first content token's record
+    // carries (ninfer::ExecutionOptions::readout_tokens), the typed decisions' label readout.
+    std::vector<ninfer::TokenId> readout_tokens;
+    // ninfer::ExecutionOptions::speculative_drafting: false keeps --spec's drafter off a one-token
+    // read (the typed decisions).
+    bool speculative_drafting = true;
 
     // The alternatives each reported token carries, absent unless the request asked for logprobs.
     [[nodiscard]] std::optional<int> reported_top_logprobs() const noexcept {

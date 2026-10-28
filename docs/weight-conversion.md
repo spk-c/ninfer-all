@@ -76,6 +76,8 @@ The built-in recipes are ordinary Python functions in
 | `qwen3_8_27b_gguf` | Every text, embedding, head and MTP tensor in its GGUF block format, byte for byte | `gguf` (GGUF), `vision` (mmproj GGUF) |
 | `qwen3_8_flash_next_gguf` | Qwen3.8-Flash-Next: every text tensor in its GGUF block format, byte for byte, expert banks expert-major, and the n-gram table's IQ4_NL rows in the same artifact or in a table artifact of their own; every hyper-connection matrix as ggml Q8_0 rows (the release's BF16 ones re-quantised); the MTP block from an MTP GGUF, its matrices in their blocks | `gguf` (the release's first shard), `ngram` (its second shard), `vision` (mmproj GGUF), `mtp` (an MTP GGUF) |
 | `gemma4_gguf` | Gemma 4 26B-A4B from Google's QAT GGUF (or a mixed-format GGUF of it): every matrix in its block format (Q4_0, the tied token table Q6_K), byte for byte, a block's Q, K and V grouped into one parent when they share a format and the [gate; up] MLP projections always, the vectors and expert scales as FP32; with `--components text,mtp` the assistant from its own GGUF the same way | `gguf`, `mtp` |
+| `flint_gguf` | Flint from a llama.cpp GGUF (Unsloth's UD-Q4_K_XL or another quantization): every matrix in its block format, byte for byte, the routed experts' gate and up banks interleaved per expert by whole rows, a block's Q, K and V grouped into one parent when they share a format and the [gate; up] rows of the dense MLP and the shared expert always, the router (BF16 in the GGUF), norms and sinks as FP32 | `gguf` |
+| `deepseek_v41_gguf` | DeepSeek-V4.1-Flash from ISTA-DASLab's split GSQ-RCO GGUF: every matrix in its block format, byte for byte, the routed experts' gate and up banks interleaved per expert by whole rows, the BF16 and F32 tensors (router, compressors, indexers, hyper-connection matrices, norms, sinks) as FP32, the Engram gate as the FP32 product of its BF16 factors; the Engram GGUF's IQ4_NL rows in the same artifact or in a table artifact of their own | `gguf` (the first shard), `engram` (the Engram GGUF) |
 
 The QUASAR Qwen3.8-27B NVFP4 checkpoint, which quantizes every Linear layer to NVFP4, has a driver
 of its own, `python3 -m tools.convert.quasar_nvfp4 --model DIR --dflash2 REFERENCE.ninfer --out
@@ -271,6 +273,31 @@ them (`w`, not `1 + w`). `--components text,mtp --source mtp=...` adds the multi
 assistant from a llama.cpp `gemma4-assistant` GGUF as the `mtp` component, checked against the
 target's head geometry and width. Commands, runtime defaults and measurements: [Gemma 4](gemma4.md).
 
+### Flint GGUF releases
+
+`flint_gguf` ([`flint.py`](../tools/convert/flint.py)) imports Flint from a llama.cpp GGUF of
+`RecursiveSI/flint` with `--model` holding the Hugging Face release's `config.json`, tokenizer,
+`chat_template.jinja` and `generation_config.json` and `--source gguf=...` the GGUF. It checks the
+GGUF's metadata against the config (the block geometry, the sliding-window and rotation patterns,
+the RoPE base, sigmoid gating with normalized weights, the expert widths) and imports every row as
+stored: llama.cpp keeps the experts' gate and up projections as two banks, which the artifact
+interleaves per expert ([gate rows; up rows] of expert 0, then expert 1), moving whole rows only.
+Commands, runtime defaults and measurements: [Flint](flint.md).
+
+### DeepSeek-V4.1-Flash GGUF releases
+
+`deepseek_v41_gguf` ([`deepseek_v41.py`](../tools/convert/deepseek_v41.py)) imports
+DeepSeek-V4.1-Flash from ISTA-DASLab's split GGUF with `--model` holding the base release's
+`config.json` and tokenizer, `--source gguf=` the first shard (the others are found beside it) and
+`--source engram=` the Engram GGUF. It checks the GGUF's metadata against the config (the block
+geometry, the compression ratios, the hyper-connections, the expert widths and scale, the Engram
+blocks and the ranges of their hash constants) and imports every row as stored. The release ships no Jinja chat
+template: the recipe stores its own transcription of the release's encoder and generation defaults
+([`templates/deepseek_v41`](../tools/convert/templates/deepseek_v41)) unless `--model` or
+`--resource` provides them. `--components text` stores the model alone, naming its table by the
+SHA-256 of its rows, and `engram` that table artifact, the layout the published conversions use;
+`text,engram` (the default) stores both in one file. Commands, runtime defaults and measurements: [DeepSeek-V4.1-Flash](deepseek-v41.md).
+
 ## Change part of a recipe
 
 Save the following as `my_recipe.py`:
@@ -340,7 +367,7 @@ The converter currently writes these formats:
 
 | Format | Built-in method for floating-point input | Import of already encoded input |
 |---|---|---|
-| `bf16`, `fp32`, `int32` | `cast_direct` | Direct words through the source reader |
+| `bf16`, `fp32`, `int32`, `fp16`, `uint16` | `cast_direct` (`fp16` only from values it represents exactly, `uint16` only from unsigned 16-bit words) | Direct words through the source reader |
 | `q4_g64_fp16`, `q5_g64_fp16`, `q6_g64_fp16`, `q8_g32_fp16` | `grouped_absmax`, `grouped_search` | Supply a custom method/source if needed |
 | `fp8_e4m3fn_row_bf16` | `fp8_row_maxabs` | `import_encoded` |
 | `nvfp4` | Supply a custom quantizer | `import_encoded` |

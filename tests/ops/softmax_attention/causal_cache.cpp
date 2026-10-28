@@ -49,6 +49,9 @@ constexpr std::int32_t kRk8ValueGroup  = 32;
 constexpr std::int32_t kRk8ValueGroups = kHeadDim / kRk8ValueGroup;
 constexpr float kAttentionScale        = 0.0625f;
 constexpr std::uint16_t kOutputCanary  = 0x7fc1u;
+// BF16 50.0: a canary for cases whose expected outputs are non-finite, which the NaN canary is too.
+constexpr std::uint16_t kFiniteOutputCanary = 0x4248u;
+constexpr std::uint16_t kF16Infinity        = 0x7c00u;
 
 // The Op contract pairs the family/key-plane dtype with the value plane's code dtype
 // (D256KVCacheProfile); the harness names the pair. A DType::U8 value code selects the rk8v4
@@ -211,6 +214,15 @@ struct Geometry {
 constexpr Geometry kGeometries[] = {
     {"d256-h24-kv4", 24, 4},
     {"d256-h16-kv2", 16, 2},
+};
+
+// Tensor-parallel shares of those two: one rank's run of KV heads with the query heads that read
+// them.
+constexpr Geometry kShareGeometries[] = {
+    {"d256-h18-kv3", 18, 3},
+    {"d256-h12-kv2", 12, 2},
+    {"d256-h6-kv1", 6, 1},
+    {"d256-h8-kv1", 8, 1},
 };
 
 ops::AttentionHeadGeometry op_geometry(const Geometry& geometry) {
@@ -1590,14 +1602,54 @@ std::vector<T> copy_from_guarded(const GuardedDeviceBuffer& buffer, std::size_t 
     return values;
 }
 
+// Where a test cache's pages go: the block table its kernels read, and the plane page each logical
+// page is written to. A rank of a position-split cache holds the physical pages p with
+// p % stride == residue at plane page p / stride; the other logical pages land in a spare plane
+// page nothing reads.
+struct CachePageTables {
+    std::int32_t physical_pages = 0;
+    std::vector<std::int32_t> kernel;
+    std::vector<std::int32_t> scatter;
+    std::int32_t stride  = 1;
+    std::int32_t residue = 0;
+};
+
+CachePageTables cache_page_tables(std::int32_t logical_pages, MappingPattern mapping,
+                                  std::int32_t stride = 1, std::int32_t residue = 0) {
+    CachePageTables out;
+    out.kernel  = make_block_table(logical_pages, mapping);
+    out.stride  = stride;
+    out.residue = residue;
+    if (stride == 1) {
+        out.physical_pages = physical_page_count(logical_pages, mapping);
+        out.scatter        = out.kernel;
+        return out;
+    }
+    const std::int32_t local = (physical_page_count(logical_pages, mapping) + stride - 1) / stride;
+    out.physical_pages       = local + 1;
+    for (const std::int32_t page : out.kernel) {
+        out.scatter.push_back(page % stride == residue ? page / stride : local);
+    }
+    return out;
+}
+
 class DeviceCache {
 public:
     DeviceCache(const HostCache& cache, MappingPattern mapping)
+        : DeviceCache(cache,
+                      cache_page_tables(cache.logical_capacity / kPagedKVPageSize, mapping)) {}
+    // Rank `residue` of a cache split by positions over `stride` ranks.
+    DeviceCache(const HostCache& cache, MappingPattern mapping, std::int32_t stride,
+                std::int32_t residue)
+        : DeviceCache(cache, cache_page_tables(cache.logical_capacity / kPagedKVPageSize, mapping,
+                                               stride, residue)) {}
+
+    DeviceCache(const HostCache& cache, CachePageTables tables)
         : geometry_(cache.geometry), storage_(cache.storage), layout_(test_cache_layout(storage_)),
           max_context_(cache.max_context), logical_capacity_(cache.logical_capacity),
           logical_pages_(logical_capacity_ / kPagedKVPageSize),
-          physical_pages_(physical_page_count(logical_pages_, mapping)),
-          block_table_host_(make_block_table(logical_pages_, mapping)),
+          physical_pages_(tables.physical_pages),
+          block_table_host_(std::move(tables.scatter)),
           k_scale_extent_(layout_.key.scale_extent), v_scale_extent_(layout_.value.scale_extent),
           k_code_elements_(
               physical_plane_elements(layout_.key.code_extent, geometry_, physical_pages_)),
@@ -1615,9 +1667,11 @@ public:
           v_scale_(layout_.value.scale_extent == 0
                        ? 1
                        : v_scale_elements_ * dtype_size(layout_.value.scale_dtype)),
-          block_table_(block_table_host_.size() * sizeof(std::int32_t)) {
-        block_table_.copy_from_host(block_table_host_.data(),
-                                    block_table_host_.size() * sizeof(std::int32_t));
+          block_table_(block_table_host_.size() * sizeof(std::int32_t)),
+          page_stride_(tables.stride), page_residue_(tables.residue),
+          kernel_table_(std::move(tables.kernel)) {
+        block_table_.copy_from_host(kernel_table_.data(),
+                                    kernel_table_.size() * sizeof(std::int32_t));
         if (storage_ == KvCacheStorage::BFloat16) {
             const auto k_physical =
                 scatter_paged(cache.k_bf16, kHeadDim, geometry_, logical_capacity_,
@@ -1746,6 +1800,8 @@ public:
         result.num_kv_heads = geometry_.kv_heads;
         result.head_dim     = kHeadDim;
         result.storage      = storage_;
+        result.page_stride  = page_stride_;
+        result.page_residue = page_residue_;
         if (layout_.key.scale_extent != 0) {
             result.k_scale_pages = Tensor(
                 k_scale_.data(), layout_.key.scale_dtype,
@@ -1770,6 +1826,8 @@ public:
             .head_dim      = direct.head_dim,
             .num_kv_heads  = direct.num_kv_heads,
             .storage       = direct.storage,
+            .page_stride   = direct.page_stride,
+            .page_residue  = direct.page_residue,
         };
     }
 
@@ -1893,8 +1951,8 @@ public:
         failures += block_table_.verify_guards((label + " block-table").c_str());
         failures +=
             verify_exact((label + " block-table unchanged").c_str(),
-                         copy_from_guarded<std::int32_t>(block_table_, block_table_host_.size()),
-                         block_table_host_);
+                         copy_from_guarded<std::int32_t>(block_table_, kernel_table_.size()),
+                         kernel_table_);
         return failures;
     }
 
@@ -1918,6 +1976,11 @@ private:
     GuardedDeviceBuffer k_scale_;
     GuardedDeviceBuffer v_scale_;
     GuardedDeviceBuffer block_table_;
+    std::int32_t page_stride_  = 1;
+    std::int32_t page_residue_ = 0;
+    // The block table the kernels read (physical pages); block_table_host_ maps each logical page
+    // to the plane page it is written to.
+    std::vector<std::int32_t> kernel_table_;
 };
 
 class BatchDeviceCache {
@@ -3784,6 +3847,126 @@ int run_int8_prompt_cases(bool fast) {
     return failures;
 }
 
+// A V value past the FP16 scale range (|V| above 127 * 65504, 7 * 65504 for int4 codes, or an
+// infinite one, which a fault upstream can leave) stores an infinite group scale. Here every V
+// group scale of kv head 0 at one cached position is infinite, and every query row sees that
+// position, so the oracle's outputs of kv head 0's query heads are non-finite. The kernel must
+// return (the fast prompt kernel once rescaled such a tile forever), write those outputs non-finite
+// and the other heads as the oracle. The output canary is finite, so an unwritten output fails.
+int run_infinite_value_scale_case(const Geometry& geometry, KvCacheStorage storage,
+                                  const AttentionCase& test_case, MappingPattern mapping) {
+    const std::int32_t total       = test_case.base + test_case.tokens;
+    const std::int32_t max_context = static_cast<std::int32_t>(
+        std::max<std::uint32_t>(static_cast<std::uint32_t>(total + 3), test_case.envelope_max));
+    const std::size_t q_elements = static_cast<std::size_t>(kHeadDim) *
+                                   static_cast<std::size_t>(geometry.q_heads) *
+                                   static_cast<std::size_t>(test_case.tokens);
+    const std::vector<float> q = make_bf16_values(q_elements, test_case.seed, -0.25f, 0.25f);
+    std::vector<std::int32_t> positions(static_cast<std::size_t>(test_case.tokens));
+    for (std::int32_t token = 0; token < test_case.tokens; ++token) {
+        positions[static_cast<std::size_t>(token)] = test_case.base + token;
+    }
+    const ops::CausalAttentionExecutionEnvelope envelope{
+        static_cast<std::uint32_t>(total), test_case.envelope_max, test_case.fast_prompt_kernel,
+        test_case.wide_verification, test_case.small_prefill};
+
+    HostCache cache_host = make_cache(geometry, storage, max_context, test_case.seed + 10u);
+    const std::int32_t poisoned = test_case.base / 2;
+    if (cache_host.packed_values()) {
+        for (std::int32_t group = 0; group < kRk8ValueGroups; ++group) {
+            cache_host.v_scale[plane_scale_index(geometry, cache_host.logical_capacity, 0, poisoned,
+                                                 group, cache_host.v_scale_extent())] =
+                kF16Infinity;
+        }
+    } else {
+        for (std::int32_t group = 0; group < kQuantGroups; ++group) {
+            cache_host.v_scale[scale_index(geometry, cache_host.logical_capacity, 0, poisoned,
+                                           group)] = kF16Infinity;
+        }
+    }
+    const std::vector<double> reference = ideal_attention(q, cache_host, positions);
+    DeviceCache cache(cache_host, mapping);
+
+    const std::vector<std::uint16_t> q_bits = to_bf16_bits(q);
+    GuardedDeviceBuffer dq(q_bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer dp(positions.size() * sizeof(std::int32_t));
+    GuardedDeviceBuffer dout(q_bits.size() * sizeof(std::uint16_t));
+    dq.copy_from_host(q_bits.data(), q_bits.size() * sizeof(std::uint16_t));
+    dp.copy_from_host(positions.data(), positions.size() * sizeof(std::int32_t));
+    std::vector<std::uint16_t> output_canary(q_bits.size(), kFiniteOutputCanary);
+    dout.copy_from_host(output_canary.data(), output_canary.size() * sizeof(std::uint16_t));
+
+    Tensor tq(dq.data(), DType::BF16, {kHeadDim, geometry.q_heads, test_case.tokens});
+    Tensor tp(dp.data(), DType::I32, {test_case.tokens});
+    Tensor tout(dout.data(), DType::BF16, {kHeadDim, geometry.q_heads, test_case.tokens});
+    const std::size_t workspace_bytes = ops::causal_softmax_attention_workspace_capacity_bytes(
+        op_geometry(geometry), storage, envelope, 1, test_case.tokens, test_case.tokens);
+    GuardedDeviceBuffer workspace_buffer(std::max<std::size_t>(workspace_bytes, 256));
+    WorkspaceArena workspace(DeviceSpan{workspace_buffer.data(), workspace_buffer.bytes()});
+
+    ops::causal_softmax_attention_cached(tq, tp, op_geometry(geometry), kAttentionScale,
+                                         cache.view(), envelope, workspace, tout, nullptr);
+    cuda_synchronize();
+
+    const std::string label = case_label("causal_softmax_attention_cached infinite V scale",
+                                         geometry, storage, test_case, mapping);
+    const std::vector<double> output =
+        bf16_bits_to_double(copy_from_guarded<std::uint16_t>(dout, q_bits.size()));
+    std::vector<double> other_output;
+    std::vector<double> other_reference;
+    std::size_t finite        = 0;
+    std::size_t oracle_finite = 0;
+    for (std::int32_t token = 0; token < test_case.tokens; ++token) {
+        for (std::int32_t head = 0; head < geometry.q_heads; ++head) {
+            for (std::int32_t d = 0; d < kHeadDim; ++d) {
+                const std::size_t index = q_index(geometry, head, d, token);
+                if (head < geometry.query_group()) {
+                    finite += std::isfinite(output[index]) ? 1 : 0;
+                    oracle_finite += std::isfinite(reference[index]) ? 1 : 0;
+                } else {
+                    other_output.push_back(output[index]);
+                    other_reference.push_back(reference[index]);
+                }
+            }
+        }
+    }
+    int failures = 0;
+    if (oracle_finite != 0) {
+        std::cerr << label << ": " << oracle_finite << " oracle outputs of kv head 0 are finite\n";
+        ++failures;
+    }
+    if (finite != 0) {
+        std::cerr << label << ": " << finite << " outputs of kv head 0 are finite\n";
+        ++failures;
+    }
+    failures += verify_attention(label + " other kv heads", other_output, other_reference,
+                                 attention_criterion(storage));
+    failures += dout.verify_guards((label + " output").c_str());
+    failures += workspace_buffer.verify_guards((label + " workspace").c_str());
+    failures += cache.verify_guards(label);
+    return failures;
+}
+
+// Infinite V group scales for one INT8-family prompt kernel: INT8 and packed INT4 values, over a
+// wide launch and a narrow one past a deeper cache.
+int run_infinite_value_scale_cases(bool fast) {
+    const auto with = [fast](AttentionCase test_case) {
+        test_case.fast_prompt_kernel = fast;
+        return test_case;
+    };
+    int failures = 0;
+    for (const KvCacheStorage storage :
+         {KvCacheStorage::Int8Group64, KvCacheStorage::RotatedInt4KeyInt4ValueE8}) {
+        failures += run_infinite_value_scale_case(kGeometries[0], storage,
+                                                  with({300, 700, 1000, 961u}),
+                                                  MappingPattern::Fragmented);
+        failures += run_infinite_value_scale_case(kGeometries[1], storage,
+                                                  with({129, 2000, 2129, 962u}),
+                                                  MappingPattern::Identity);
+    }
+    return failures;
+}
+
 // BF16 values beyond FP16's range. Turing builds run BF16-cache attention on FP16 MMA and stage a
 // tile that holds such a value as BF16 for the exact emulation (common/bf16_attention.cuh): values
 // of up to 2^17 send every tile there, one key of 2^17 its own tile only. Decode, verification and
@@ -4518,7 +4701,9 @@ int run_batch_profile_validation_cases() {
 
 int run_softmax_attention_int8_prompt_tests() {
     if (cuda_unavailable()) return 77;
-    const int failures = run_int8_prompt_cases(false) + run_int8_prompt_cases(true);
+    const int failures = run_int8_prompt_cases(false) + run_int8_prompt_cases(true) +
+                         run_infinite_value_scale_cases(false) +
+                         run_infinite_value_scale_cases(true);
     std::cout << (failures ? "FAIL" : "PASS") << " INT8 prompt-scale causal attention\n";
     return failures ? 1 : 0;
 }
@@ -4527,10 +4712,11 @@ int run_softmax_attention_int8_prompt_tests() {
 // CTAs per row block (main sets NINFER_PROMPT_SPLITS=3 before the first launch), against the FP64
 // oracle: the INT8 prompt cases, rk8v4 and rk4v4 over partial and full row blocks, launches whose
 // early row blocks see fewer key pages than splits (their late splits own no visible key), an
-// envelope far past the populated keys, and masked columns through the batched entry.
+// envelope far past the populated keys, masked columns through the batched entry, and infinite V
+// scales.
 int run_softmax_attention_prompt_split_tests() {
     if (cuda_unavailable()) return 77;
-    int failures    = run_int8_prompt_cases(true);
+    int failures    = run_int8_prompt_cases(true) + run_infinite_value_scale_cases(true);
     const auto fast = [](AttentionCase test_case) {
         test_case.fast_prompt_kernel = true;
         return test_case;
@@ -4738,6 +4924,83 @@ int run_softmax_attention_causal_cache_tests() {
     return failures == 0 ? 0 : 1;
 }
 
+// The share geometries through a storage's decode routes (one and six columns, single requests and
+// batches, short and split-key windows) and its verification and prompt routes (8 to 65 columns).
+template <class Cache>
+int run_share_decode_cases(const Cache& cache, std::uint32_t seed) {
+    int failures = 0;
+    for (const Geometry& geometry : kShareGeometries) {
+        failures += run_a1_case(geometry, cache, {1, 0, 1, seed}, MappingPattern::Identity);
+        failures +=
+            run_a3_case(geometry, cache, {1, 128, 192, seed + 1u}, MappingPattern::Fragmented);
+        failures +=
+            run_a1_case(geometry, cache, {6, 61, 192, seed + 2u}, MappingPattern::Fragmented);
+        failures +=
+            run_a3_case(geometry, cache, {1, 8191, 8192, seed + 3u}, MappingPattern::Fragmented);
+        failures += run_batch_case(
+            geometry, cache, {6, {61, 127}, {6, 3}, {1, 0}, MappingPattern::Fragmented, seed + 4u});
+        failures += run_batch_case(geometry, cache,
+                                   {1,
+                                    {0, 63, 127, 2048},
+                                    {1, 1, 1, 1},
+                                    {2, 0, 3, 1},
+                                    MappingPattern::Fragmented,
+                                    seed + 5u});
+    }
+    return failures;
+}
+
+template <class Cache>
+int run_share_prompt_cases(const Cache& cache, std::uint32_t seed) {
+    int failures = 0;
+    for (const Geometry& geometry : kShareGeometries) {
+        failures += run_a1_case(geometry, cache, {8, 61, 192, seed}, MappingPattern::Identity);
+        failures += run_a1_case(geometry, cache, {17, 31, 48, seed + 1u}, MappingPattern::Identity);
+        failures +=
+            run_a1_case(geometry, cache, {65, 63, 192, seed + 2u}, MappingPattern::Fragmented);
+        failures += run_a3_case(geometry, cache, {65, 63, 192, seed + 3u}, MappingPattern::Offset);
+    }
+    return failures;
+}
+
+int run_softmax_attention_tensor_share_tests() {
+    if (cuda_unavailable()) {
+        std::cout << "SKIP: no usable CUDA device\n";
+        return 77;
+    }
+    int failures       = 0;
+    std::uint32_t seed = 5000u;
+    for (const CachePlan& plan : {kPlanBf16, kPlanInt8, kPlanRk8v4, kPlanRk4v4}) {
+        failures += run_share_decode_cases(plan, seed);
+        failures += run_share_prompt_cases(plan, seed + 10u);
+        seed += 20u;
+    }
+    for (const KvCacheStorage storage :
+         {KvCacheStorage::RotatedInt4KeyInt4ValueE8, KvCacheStorage::RotatedE8RootKeyInt4Value}) {
+        failures += run_share_decode_cases(storage, seed);
+        failures += run_share_prompt_cases(storage, seed + 10u);
+        seed += 20u;
+    }
+    // FP8, NVFP4 and k8v4 decode and prompt separately: a prompt route an architecture lacks must
+    // not skip the decode cases.
+    failures += run_case_allowing_arch_skip("tensor-share FP8 KV cache (decode)",
+                                            [] { return run_share_decode_cases(kPlanFp8, 5200u); });
+    failures += run_case_allowing_arch_skip("tensor-share FP8 KV cache (prompt)",
+                                            [] { return run_share_prompt_cases(kPlanFp8, 5210u); });
+    for (const KvCacheStorage storage :
+         {KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value}) {
+        const std::uint32_t base = storage == KvCacheStorage::Nvfp4Group16 ? 5220u : 5240u;
+        failures += run_case_allowing_arch_skip("tensor-share narrow-float KV cache (decode)", [&] {
+            return run_share_decode_cases(storage, base);
+        });
+        failures += run_case_allowing_arch_skip("tensor-share narrow-float KV cache (prompt)", [&] {
+            return run_share_prompt_cases(storage, base + 10u);
+        });
+    }
+    std::cout << (failures == 0 ? "PASS" : "FAIL") << " tensor-parallel share geometries\n";
+    return failures == 0 ? 0 : 1;
+}
+
 int run_softmax_attention_parallel_tile_tests() {
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
@@ -4746,5 +5009,328 @@ int run_softmax_attention_parallel_tile_tests() {
     int failures = 0;
     for (const CachePlan& plan : {kPlanInt8, kPlanRk8v4}) failures += run_parallel_tile_cases(plan);
     std::cout << (failures == 0 ? "PASS" : "FAIL") << " parallel query tiles\n";
+    return failures == 0 ? 0 : 1;
+}
+
+namespace {
+
+// The FP64-oracle inputs of a single-row call: new tokens [base, base + tokens) over a cache.
+struct RowInputs {
+    std::vector<float> q;
+    std::vector<float> k;
+    std::vector<float> v;
+    std::vector<std::int32_t> positions;
+};
+
+RowInputs make_row_inputs(const Geometry& geometry, std::int32_t base, std::int32_t tokens,
+                          std::uint32_t seed) {
+    RowInputs out;
+    const auto columns = static_cast<std::size_t>(tokens);
+    out.q = make_bf16_values(static_cast<std::size_t>(kHeadDim) * geometry.q_heads * columns, seed,
+                             -0.25f, 0.25f);
+    out.k = make_bf16_values(static_cast<std::size_t>(kHeadDim) * geometry.kv_heads * columns,
+                             seed + 1u, -0.25f, 0.25f);
+    out.v = make_bf16_values(static_cast<std::size_t>(kHeadDim) * geometry.kv_heads * columns,
+                             seed + 2u, -1.0f, 1.0f);
+    for (std::int32_t token = 0; token < tokens; ++token) { out.positions.push_back(base + token); }
+    return out;
+}
+
+// One single-row causal_softmax_attention call of the first `tokens` columns of `inputs` (the
+// layouts put the token outermost, so a prefix is the first columns) over `view`. Returns the BF16
+// output bits, or fills `partial` (FP32, causal_attention_partial_elements) when it is given.
+std::vector<std::uint16_t> run_row(const Geometry& geometry, const RowInputs& inputs,
+                                   std::int32_t tokens, PagedKVBatchLayerView view,
+                                   ops::CausalAttentionExecutionEnvelope envelope,
+                                   GuardedDeviceBuffer* partial = nullptr) {
+    const std::size_t q_count  = static_cast<std::size_t>(kHeadDim) * geometry.q_heads * tokens;
+    const std::size_t kv_count = static_cast<std::size_t>(kHeadDim) * geometry.kv_heads * tokens;
+    const std::vector<std::uint16_t> q_bits =
+        to_bf16_bits(std::vector<float>(inputs.q.begin(), inputs.q.begin() + q_count));
+    const std::vector<std::uint16_t> k_bits =
+        to_bf16_bits(std::vector<float>(inputs.k.begin(), inputs.k.begin() + kv_count));
+    const std::vector<std::uint16_t> v_bits =
+        to_bf16_bits(std::vector<float>(inputs.v.begin(), inputs.v.begin() + kv_count));
+    GuardedDeviceBuffer dq(q_bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer dk(k_bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer dv(v_bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer dp(static_cast<std::size_t>(tokens) * sizeof(std::int32_t));
+    GuardedDeviceBuffer drow(sizeof(std::int32_t));
+    GuardedDeviceBuffer dout(q_bits.size() * sizeof(std::uint16_t));
+    dq.copy_from_host(q_bits.data(), q_bits.size() * sizeof(std::uint16_t));
+    dk.copy_from_host(k_bits.data(), k_bits.size() * sizeof(std::uint16_t));
+    dv.copy_from_host(v_bits.data(), v_bits.size() * sizeof(std::uint16_t));
+    dp.copy_from_host(inputs.positions.data(),
+                      static_cast<std::size_t>(tokens) * sizeof(std::int32_t));
+    const std::int32_t row = 0;
+    drow.copy_from_host(&row, sizeof(row));
+    Tensor tq(dq.data(), DType::BF16, {kHeadDim, geometry.q_heads, tokens});
+    Tensor tk(dk.data(), DType::BF16, {kHeadDim, geometry.kv_heads, tokens});
+    Tensor tv(dv.data(), DType::BF16, {kHeadDim, geometry.kv_heads, tokens});
+    Tensor tp(dp.data(), DType::I32, {tokens});
+    Tensor trow(drow.data(), DType::I32, {1});
+    Tensor tout(dout.data(), DType::BF16, {kHeadDim, geometry.q_heads, tokens});
+    const std::size_t workspace_bytes = ops::causal_softmax_attention_workspace_capacity_bytes(
+        op_geometry(geometry), view.storage, envelope, 1, tokens, tokens);
+    GuardedDeviceBuffer workspace_buffer(std::max<std::size_t>(workspace_bytes, 256));
+    WorkspaceArena workspace(DeviceSpan{workspace_buffer.data(), workspace_buffer.bytes()});
+    Tensor tpartial;
+    if (partial != nullptr) {
+        tpartial = Tensor(partial->data(), DType::FP32,
+                          {static_cast<std::int32_t>(
+                              ops::causal_attention_partial_elements(geometry.q_heads, tokens))});
+    }
+    ops::causal_softmax_attention(tq, tk, tv, tp, Tensor{}, trow, op_geometry(geometry),
+                                  kAttentionScale, view, envelope, workspace, tout, nullptr,
+                                  nullptr, partial != nullptr ? &tpartial : nullptr);
+    cuda_synchronize();
+    return copy_from_guarded<std::uint16_t>(dout, q_bits.size());
+}
+
+// The represented cache of any storage: rk8v4 and rk4v4 come from their plans, which the storage
+// overload of make_cache does not build.
+HostCache make_storage_cache(const Geometry& geometry, KvCacheStorage storage,
+                             std::int32_t max_context, std::uint32_t seed) {
+    if (storage == KvCacheStorage::RotatedInt8KeyInt4ValueGroup64) {
+        return make_cache(geometry, kPlanRk8v4, max_context, seed);
+    }
+    if (storage == KvCacheStorage::RotatedLloyd4KeyInt4Value) {
+        return make_cache(geometry, kPlanRk4v4, max_context, seed);
+    }
+    return make_cache(geometry, storage, max_context, seed);
+}
+
+// Position-split attention over `ranks` ranks, each holding the pages p % ranks == r of one cache:
+// every rank appends and attends over its own keys into a partial, and their merge is attention
+// over every key (the FP64 oracle). A merge of a run of query heads is the same bytes as those
+// heads of the whole merge.
+int run_position_split_case(const Geometry& geometry, KvCacheStorage storage,
+                            const AttentionCase& test_case, MappingPattern mapping,
+                            std::int32_t ranks) {
+    const std::int32_t total       = test_case.base + test_case.tokens;
+    const std::int32_t max_context = static_cast<std::int32_t>(
+        std::max<std::uint32_t>(static_cast<std::uint32_t>(total + 3), test_case.envelope_max));
+    const RowInputs inputs = make_row_inputs(geometry, test_case.base, test_case.tokens,
+                                             test_case.seed);
+    const ops::CausalAttentionExecutionEnvelope envelope{
+        static_cast<std::uint32_t>(total), test_case.envelope_max, test_case.fast_prompt_kernel,
+        test_case.wide_verification, test_case.small_prefill};
+    const HostCache initial =
+        make_storage_cache(geometry, storage, max_context, test_case.seed + 10u);
+    HostCache expected      = initial;
+    append_cache(expected, inputs.k, inputs.v, inputs.positions);
+    const std::vector<double> reference = ideal_attention(inputs.q, expected, inputs.positions);
+
+    const std::size_t elements =
+        ops::causal_attention_partial_elements(geometry.q_heads, test_case.tokens);
+    std::vector<std::unique_ptr<DeviceCache>> caches;
+    std::vector<std::unique_ptr<GuardedDeviceBuffer>> partials;
+    std::vector<const float*> sources;
+    for (std::int32_t rank = 0; rank < ranks; ++rank) {
+        caches.push_back(std::make_unique<DeviceCache>(initial, mapping, ranks, rank));
+        partials.push_back(std::make_unique<GuardedDeviceBuffer>(elements * sizeof(float)));
+        (void)run_row(geometry, inputs, test_case.tokens, caches.back()->batch_view(), envelope,
+                      partials.back().get());
+        sources.push_back(static_cast<const float*>(partials.back()->data()));
+    }
+    const std::size_t out_count =
+        static_cast<std::size_t>(kHeadDim) * geometry.q_heads * test_case.tokens;
+    GuardedDeviceBuffer dout(out_count * sizeof(std::uint16_t));
+    Tensor tout(dout.data(), DType::BF16, {kHeadDim, geometry.q_heads, test_case.tokens});
+    ops::causal_attention_merge_partials(sources, geometry.q_heads, test_case.tokens, 0, nullptr,
+                                         tout, nullptr);
+    const std::int32_t begin = geometry.query_group();
+    const std::int32_t heads = geometry.q_heads - begin;
+    const std::size_t run_count = static_cast<std::size_t>(kHeadDim) * heads * test_case.tokens;
+    GuardedDeviceBuffer drun(run_count * sizeof(std::uint16_t));
+    Tensor trun(drun.data(), DType::BF16, {kHeadDim, heads, test_case.tokens});
+    ops::causal_attention_merge_partials(sources, geometry.q_heads, test_case.tokens, begin,
+                                         nullptr, trun, nullptr);
+    cuda_synchronize();
+
+    const std::string label = case_label("position-split attention", geometry, storage, test_case,
+                                         mapping) +
+                              " ranks=" + std::to_string(ranks);
+    const std::vector<std::uint16_t> output = copy_from_guarded<std::uint16_t>(dout, out_count);
+    int failures = verify_attention(label, bf16_bits_to_double(output), reference,
+                                    attention_criterion(storage));
+    const std::vector<std::uint16_t> run = copy_from_guarded<std::uint16_t>(drun, run_count);
+    for (std::int32_t column = 0; column < test_case.tokens && failures == 0; ++column) {
+        for (std::int32_t head = 0; head < heads; ++head) {
+            for (std::int32_t d = 0; d < kHeadDim; ++d) {
+                const std::size_t at_run =
+                    d + static_cast<std::size_t>(kHeadDim) * (head + heads * column);
+                const std::size_t at_all = d + static_cast<std::size_t>(kHeadDim) *
+                                                   (begin + head + geometry.q_heads * column);
+                if (run[at_run] != output[at_all]) {
+                    std::cerr << label << ": head-run merge differs at column " << column
+                              << " head " << begin + head << '\n';
+                    ++failures;
+                    break;
+                }
+            }
+        }
+    }
+    for (std::int32_t rank = 0; rank < ranks; ++rank) {
+        failures += caches[rank]->verify_guards(label + " rank " + std::to_string(rank));
+        failures += partials[rank]->verify_guards((label + " partial").c_str());
+    }
+    failures += dout.verify_guards((label + " output").c_str());
+    return failures;
+}
+
+// Invariant reductions: with the context's fixed key segments, a column's output is the same
+// bytes whether its call holds 1, 3 or 8 columns, alone or in a batch of two rows.
+int run_invariant_case(const Geometry& geometry, KvCacheStorage storage, std::int32_t base,
+                       std::uint32_t seed) {
+    constexpr std::int32_t kWidest  = 8;
+    constexpr std::int32_t kContext = 8192;
+    const std::uint32_t segment     = ops::causal_attention_invariant_segment_keys(kContext);
+    const RowInputs inputs          = make_row_inputs(geometry, base, kWidest, seed);
+    const HostCache initial         = make_storage_cache(geometry, storage, kContext, seed + 10u);
+    const auto envelope_for         = [&](std::int32_t width) {
+        return ops::CausalAttentionExecutionEnvelope{
+            .min_visible_keys       = static_cast<std::uint32_t>(base + width),
+            .max_visible_keys       = static_cast<std::uint32_t>(kContext),
+            .invariant_segment_keys = segment};
+    };
+    const std::string label = std::string("invariant attention ") + geometry.name + " " +
+                              cache_name(storage) + " base=" + std::to_string(base);
+    const std::size_t column = static_cast<std::size_t>(kHeadDim) * geometry.q_heads;
+    DeviceCache widest_cache(initial, MappingPattern::Fragmented);
+    const std::vector<std::uint16_t> widest = run_row(geometry, inputs, kWidest,
+                                                      widest_cache.batch_view(),
+                                                      envelope_for(kWidest));
+    int failures = 0;
+    for (const std::int32_t width : {1, 3}) {
+        DeviceCache cache(initial, MappingPattern::Identity);
+        const std::vector<std::uint16_t> narrow =
+            run_row(geometry, inputs, width, cache.batch_view(), envelope_for(width));
+        if (!std::equal(narrow.begin(), narrow.end(), widest.begin())) {
+            std::cerr << label << ": W=" << width << " differs from W=" << kWidest << '\n';
+            ++failures;
+        }
+    }
+    // Two rows of the same history and queries, batched at width 3.
+    {
+        constexpr std::int32_t kWidth = 3;
+        const std::vector<HostCache> rows{initial, initial};
+        BatchDeviceCache cache(rows, MappingPattern::Identity);
+        std::vector<float> q, k, v;
+        std::vector<std::int32_t> positions;
+        const std::size_t q_columns  = column * kWidth;
+        const std::size_t kv_columns =
+            static_cast<std::size_t>(kHeadDim) * geometry.kv_heads * kWidth;
+        for (int row = 0; row < 2; ++row) {
+            q.insert(q.end(), inputs.q.begin(), inputs.q.begin() + q_columns);
+            k.insert(k.end(), inputs.k.begin(), inputs.k.begin() + kv_columns);
+            v.insert(v.end(), inputs.v.begin(), inputs.v.begin() + kv_columns);
+            positions.insert(positions.end(), inputs.positions.begin(),
+                             inputs.positions.begin() + kWidth);
+        }
+        const std::vector<std::uint16_t> q_bits = to_bf16_bits(q);
+        const std::vector<std::uint16_t> k_bits = to_bf16_bits(k);
+        const std::vector<std::uint16_t> v_bits = to_bf16_bits(v);
+        const std::vector<std::int32_t> table_rows{0, 1};
+        GuardedDeviceBuffer dq(q_bits.size() * 2), dk(k_bits.size() * 2), dv(v_bits.size() * 2);
+        GuardedDeviceBuffer dp(positions.size() * 4), drows(8), dout(q_bits.size() * 2);
+        dq.copy_from_host(q_bits.data(), q_bits.size() * 2);
+        dk.copy_from_host(k_bits.data(), k_bits.size() * 2);
+        dv.copy_from_host(v_bits.data(), v_bits.size() * 2);
+        dp.copy_from_host(positions.data(), positions.size() * 4);
+        drows.copy_from_host(table_rows.data(), 8);
+        Tensor tq(dq.data(), DType::BF16, {kHeadDim, geometry.q_heads, kWidth, 2});
+        Tensor tk(dk.data(), DType::BF16, {kHeadDim, geometry.kv_heads, kWidth, 2});
+        Tensor tv(dv.data(), DType::BF16, {kHeadDim, geometry.kv_heads, kWidth, 2});
+        Tensor tp(dp.data(), DType::I32, {kWidth, 2});
+        Tensor trows(drows.data(), DType::I32, {2});
+        Tensor tout(dout.data(), DType::BF16, {kHeadDim, geometry.q_heads, kWidth, 2});
+        const auto envelope = envelope_for(kWidth);
+        const std::size_t workspace_bytes = ops::causal_softmax_attention_workspace_capacity_bytes(
+            op_geometry(geometry), storage, envelope, 2, kWidth, kWidth);
+        GuardedDeviceBuffer workspace_buffer(std::max<std::size_t>(workspace_bytes, 256));
+        WorkspaceArena workspace(DeviceSpan{workspace_buffer.data(), workspace_buffer.bytes()});
+        ops::causal_softmax_attention(tq, tk, tv, tp, Tensor{}, trows, op_geometry(geometry),
+                                      kAttentionScale, cache.view(), envelope, workspace, tout,
+                                      nullptr);
+        cuda_synchronize();
+        const std::vector<std::uint16_t> batched =
+            copy_from_guarded<std::uint16_t>(dout, q_bits.size());
+        for (int row = 0; row < 2; ++row) {
+            if (!std::equal(batched.begin() + static_cast<std::ptrdiff_t>(row * q_columns),
+                            batched.begin() + static_cast<std::ptrdiff_t>((row + 1) * q_columns),
+                            widest.begin())) {
+                std::cerr << label << ": batched row " << row << " differs from W=" << kWidest
+                          << '\n';
+                ++failures;
+            }
+        }
+    }
+    return failures;
+}
+
+constexpr KvCacheStorage kEveryStorage[] = {
+    KvCacheStorage::BFloat16,
+    KvCacheStorage::Int8Group64,
+    KvCacheStorage::RotatedInt8KeyInt4ValueGroup64,
+    KvCacheStorage::RotatedLloyd4KeyInt4Value,
+    KvCacheStorage::RotatedInt4KeyInt4ValueE8,
+    KvCacheStorage::RotatedE8RootKeyInt4Value,
+    KvCacheStorage::Fp8E4M3Row256,
+    KvCacheStorage::Nvfp4Group16,
+    KvCacheStorage::Fp8KeyNvfp4Value,
+};
+
+} // namespace
+
+int run_softmax_attention_position_split_tests() {
+    if (cuda_unavailable()) return 77;
+    int failures       = 0;
+    std::uint32_t seed = 7000u;
+    for (const KvCacheStorage storage : kEveryStorage) {
+        failures += run_case_allowing_arch_skip("position-split attention", [&] {
+            int local = 0;
+            for (const Geometry& geometry : kGeometries) {
+                // Decode and verification widths (small-T), a rank holding none of the keys
+                // (fragmented pages are all odd), a small prefill (chunked small-T) and prompts.
+                local += run_position_split_case(geometry, storage, {1, 300, 512, seed},
+                                                 MappingPattern::Identity, 2);
+                local += run_position_split_case(geometry, storage, {4, 5000, 8192, seed + 1u},
+                                                 MappingPattern::Offset, 3);
+                local += run_position_split_case(geometry, storage, {1, 128, 192, seed + 2u},
+                                                 MappingPattern::Fragmented, 2);
+                local += run_position_split_case(
+                    geometry, storage,
+                    {33, 2000, 4096, seed + 3u, false, false, 1.0f, false, false, true},
+                    MappingPattern::Identity, 2);
+                local += run_position_split_case(geometry, storage, {160, 200, 512, seed + 4u},
+                                                 MappingPattern::Identity, 2);
+                local += run_position_split_case(geometry, storage, {96, 0, 128, seed + 5u},
+                                                 MappingPattern::Offset, 3);
+            }
+            return local;
+        });
+        seed += 10u;
+    }
+    std::cout << (failures == 0 ? "PASS" : "FAIL") << " position-split attention\n";
+    return failures == 0 ? 0 : 1;
+}
+
+int run_softmax_attention_invariant_tests() {
+    if (cuda_unavailable()) return 77;
+    int failures       = 0;
+    std::uint32_t seed = 7500u;
+    for (const KvCacheStorage storage : kEveryStorage) {
+        failures += run_case_allowing_arch_skip("invariant attention", [&] {
+            int local = 0;
+            for (const Geometry& geometry : kGeometries) {
+                local += run_invariant_case(geometry, storage, 61, seed);
+                local += run_invariant_case(geometry, storage, 5000, seed + 1u);
+            }
+            return local;
+        });
+        seed += 10u;
+    }
+    std::cout << (failures == 0 ? "PASS" : "FAIL") << " invariant attention\n";
     return failures == 0 ? 0 : 1;
 }

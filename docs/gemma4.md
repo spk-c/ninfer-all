@@ -54,7 +54,9 @@ frontend for tokenization, chat templates, output parsing and the serving protoc
   top-k held at the sampler's 20 candidates.
 
 Not built for this family: DFlash and ngram copy drafts, pipeline stages over several GPUs, and of
-the context cache the shared paged KV pool, the disk tier and session slots.
+the context cache the shared paged KV pool, the disk tier and session slots. Several GPUs divide
+the routed experts of the MoE model instead (`--devices 0,1 --tensor-parallel`, experts on the
+devices; [expert parallelism](maintainer/pipeline-stages.md#expert-parallelism-of-the-other-moe-families)).
 
 ## Converting
 
@@ -126,6 +128,17 @@ ninfer-serve models/gemma-4-26B-A4B-it-qat-q4_0-mtp.ninfer --model-id gemma4 \
 ninfer-serve models/gemma-4-26B-A4B-it-QAT-Q4_0-MTP-ninfer-v3.ninfer --model-id gemma4 \
   --max-context 40960 --max-concurrency 4 --spec mtp --draft-tokens 2 --vision
 ```
+
+Past the native 262,144 positions `--rope-yarn` (or a fixed `--rope-yarn-factor F`, `1..4`) rotates
+the five full-attention blocks, the assistant's included, with YaRN at factor `--max-context` /
+262,144, as it does for the Qwen families: their proportional RoPE schedule takes YaRN's
+frequencies, and their queries the square of its attention factor; the sliding-window blocks never
+see a distance past their 1024 positions and keep their rotation. Google publishes no extension of
+this model's window, so this is the same mathematics without the vendor's measurement behind it:
+the flag is accepted, the startup diagnostic and the `server_start` record's `engine.rope` say it
+is on, and a perplexity past the window is the way to judge it on your text
+([perplexity](perplexity.md#past-the-native-window)). Linear position interpolation
+(`--rope-scaling-factor`) is refused for this model.
 
 On a 24 GB card the weights take 13.4 GiB (the assistant 0.25 GiB more) and the prompt-chunk
 workspace about 1.1 GiB. Every sequence holds its whole context from the start: the rings of the 25
@@ -280,9 +293,12 @@ keeps instead of prefilling those tokens again:
   before them, so no sequence waits for the host.
 - **Shared prefixes.** A prompt chunk also ends where the frontend marks a prefix other requests
   share (the end of the leading system messages, of the tool declarations, a declared cache
-  boundary), and the state there goes to an image too, from 256 tokens on: requests with the same
-  system prompt resume after it on any sequence, also when they arrive together, since a prompt
-  that has not started prefilling looks for images again at its first chunk.
+  boundary), and the state there goes to an image too when saving it and copying it back (at
+  12 GB/s each way) take less time than computing its tokens again at the measured prefill rate
+  (0.2 ms a token until 4,096 tokens are measured): about 90 tokens on in `rk8v4`, 220 in F16 with
+  the assistant. Requests with the same system prompt resume after it on any sequence, also when
+  they arrive together, since a prompt that has not started prefilling looks for images again at
+  its first chunk. A disposable request (a decision read) leaves no image of its end.
 
 A sliding-window state cannot be cut back: the rings at a position hold the window before it, and
 each block's window reaches further back through the blocks below. A prompt therefore resumes only
@@ -535,12 +551,14 @@ Experts reach the GPU through the shared transport (`core/expert_delivery`):
   takes back the bank it fills.
 - **Cache.** `--expert-cache-mib` (default: what is free after startup) holds the experts decode and
   verification route most, by the expert tier every MoE family with host or disk experts shares
-  ([the expert cache](qwen3-8-flash-next.md#the-expert-cache)), one pool of slots for all layers: a
-  miss the GPU copies takes a free slot, or the slot of the coldest expert the call does not route
-  when its routes beat that expert's, and every four decode passes a round swaps the most routed
-  missing experts in, copied behind the calls. A prompt chunk evicts nothing; it promotes its most
-  routed experts from the bank into free slots by device copies, up to each layer's share of the
-  cache, so a long prompt does not flush decode's working set. A routing profile
+  ([the expert cache](qwen3-8-flash-next.md#the-expert-cache)). Its slots form a pool for each size
+  of expert: the layers whose experts need the same room share one, each layer about as many slots
+  as any other, so a model of mixed formats spends no slot bytes on room its experts lack. A miss
+  the GPU copies takes a free slot of its pool, or the slot of the coldest expert of that pool the
+  call does not route when its routes beat that expert's, and every four decode passes a round
+  swaps the most routed missing experts in, copied behind the calls. A prompt chunk evicts nothing;
+  it promotes its most routed experts from the bank into free slots by device copies, up to each
+  layer's share of its pool, so a long prompt does not flush decode's working set. A routing profile
   (`--expert-profile`, else the built-in one of the model family where the build has one) fills the
   slots at startup. `0` keeps the banks only.
 - **CPU share.** Of a decode or verification call's misses that neither the cache nor the layer's
@@ -551,7 +569,8 @@ Experts reach the GPU through the shared transport (`core/expert_delivery`):
   the BF16 middle quantized as q8_1 and the down rows as the GPU's vector kernels do, into the same
   2^-32 fixed-point sums ([the CPU share](qwen3-8-flash-next.md#the-cpu-share) describes the
   arithmetic), so outputs do not depend on the split. Q2_0, Q4_0, Q5_0, Q8_0, Q4_K, Q5_K, Q6_K,
-  IQ4_NL, IQ2_S, IQ3_XXS, IQ3_S and IQ4_XS blocks have CPU products; other layers copy every miss.
+  IQ4_NL, IQ1_S, IQ1_M, IQ2_XXS, IQ2_S, IQ3_XXS, IQ3_S and IQ4_XS blocks have CPU products; other
+  layers copy every miss.
   An expert the CPU computed takes no slot; the cache's rounds decide whether it enters.
 - **Calls.** Vector decode and verification run the cached pairs while the rest arrive, then the
   rest; both add to one fixed-point sum, so outputs equal resident execution bit for bit. Prompt

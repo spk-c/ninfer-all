@@ -146,6 +146,9 @@ struct PrepareStats {
 // (docs/maintainer/hybrid-prefix-cache-spec.md §7.1). Frontiers are exact token positions.
 struct PreparedTapHints {
     std::vector<runtime::prefix_cache::TapHint> hints;
+    // CacheRetentionHint::Disposable: no request continues this one, so it supersedes nothing it
+    // resumed from (docs/maintainer/hybrid-prefix-cache-spec.md §9.3).
+    bool disposable = false;
 };
 
 struct PreparedPromptData {
@@ -155,7 +158,8 @@ struct PreparedPromptData {
     std::vector<NgramSourceView> ngram_archive_sources;
     std::shared_ptr<const NgramSnapshot> ngram_snapshot;
     // The request's live ngram index over token_ids and ngram_sources, present whenever ngram
-    // drafting is enabled. Preparation builds it so admission only moves it into the request.
+    // drafting is enabled and the prompt was prepared for a drafting request. Preparation builds
+    // it so admission only moves it into the request.
     std::unique_ptr<detail::NgramProposer> ngram_index;
     // Hybrid prefix-cache lookup keys over token_ids (program/prefix/block_keys.h): one chained
     // hash per full 64-token block and, with media, one cumulative Vision key per block.

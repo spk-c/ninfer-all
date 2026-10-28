@@ -143,11 +143,12 @@ __global__ void rms_norm_kernel(const float* __restrict__ x, const float* __rest
     const int q      = hidden >> 2, i = threadIdx.x;
     const float* row = x + std::int64_t(blockIdx.x) * hidden;
     const float4 v   = i < q ? ld4(row, i) : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-    const float inv  = rsqrtf(block_sum(dot4(v, v)) / float(hidden) + eps);
-    float4 y         = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    // The weight is loaded before the reduction, whose barriers would hold the load behind it.
+    const float4 wv = i < q && w != nullptr ? ld4(w, i) : make_float4(1.0f, 1.0f, 1.0f, 1.0f);
+    const float inv = rsqrtf(block_sum(dot4(v, v)) / float(hidden) + eps);
+    float4 y        = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
     if (i < q) {
-        const float4 wv = w != nullptr ? ld4(w, i) : make_float4(1.0f, 1.0f, 1.0f, 1.0f);
-        y               = mul4(scale4(v, inv), wv);
+        y = mul4(scale4(v, inv), wv);
         if (out != nullptr) { store_bf16x4(out + std::int64_t(blockIdx.x) * hidden + 4 * i, y); }
     }
     if (q8.qs != nullptr) { store_q8x4(q8, hidden, blockIdx.x, i, y, i < q); }
@@ -173,8 +174,8 @@ __global__ void qkv_post_kernel(QkvArgs a) {
         const float inv = rsqrtf(block_sum(x0 * x0 + x1 * x1) / float(d) + a.eps);
         const float n0 = x0 * inv * a.q_norm[i], n1 = x1 * inv * a.q_norm[i + half];
         float* q = a.q_out + (std::int64_t(t) * a.query_heads + head) * d;
-        q[i]        = n0 * c - n1 * s;
-        q[i + half] = n1 * c + n0 * s;
+        q[i]        = (n0 * c - n1 * s) * a.q_scale;
+        q[i + half] = (n1 * c + n0 * s) * a.q_scale;
         return;
     }
     const int kh = head - a.query_heads;
@@ -186,7 +187,8 @@ __global__ void qkv_post_kernel(QkvArgs a) {
     const float vinv = rsqrtf(block_sum(v0 * v0 + v1 * v1) / float(d) + a.eps);
     const float n0 = k0 * kinv * a.k_norm[i], n1 = k1 * kinv * a.k_norm[i + half];
     const int sequence = a.sequences != nullptr ? a.sequences[t] : a.sequence;
-    const int slot     = a.row_slots ? t : a.ring != 0 ? position % a.ring : position;
+    const int stored   = a.slots != nullptr ? a.slots[t] : position;
+    const int slot     = a.row_slots ? t : a.ring != 0 ? stored % a.ring : stored;
     const std::int64_t at =
         std::int64_t(sequence) * a.seq_stride + std::int64_t(kh) * a.head_stride +
         std::int64_t(slot) * d;
@@ -199,13 +201,26 @@ __global__ void qkv_post_kernel(QkvArgs a) {
 }
 
 __global__ void build_mask_kernel(__half* mask, int tokens, int slots, int first, int ring,
-                                  int window, const std::int32_t* __restrict__ blocks) {
+                                  int window, const std::int32_t* __restrict__ blocks,
+                                  const std::int32_t* __restrict__ starts) {
     const int s = blockIdx.x * blockDim.x + threadIdx.x;
     const int t = blockIdx.y;
     if (s >= slots) { return; }
     const int query = first + t;
     bool visible    = false;
-    if (ring == 0) {
+    if (starts != nullptr) {
+        // A branch row: the positions before `first` as its own position sees them (the window
+        // ends at the same distance), and its branch's rows, which lie at positions first +
+        // starts[t] onwards, up to itself.
+        const int own  = first + starts[t];
+        const int last = first + tokens - 1;
+        const int p    = ring == 0 ? s : s <= last ? s + ((last - s) / ring) * ring : -1;
+        if (p >= 0 && p < first) {
+            visible = ring == 0 || p > query - (own - first) - window;
+        } else if (p >= own && p <= query) {
+            visible = ring == 0 || p > query - window;
+        }
+    } else if (ring == 0) {
         visible = s <= query;
     } else {
         const int last = first + tokens - 1;
@@ -243,10 +258,12 @@ __global__ void rope_table_kernel(const float* __restrict__ freq, int pairs, int
 // Block (position, head): D/2 threads, one pair each.
 __global__ void derive_keys_kernel(const __half* __restrict__ v, std::int64_t head_stride, int d,
                                    const float* __restrict__ w, const float2* __restrict__ rope,
-                                   int pairs, __half* __restrict__ k) {
+                                   int pairs, __half* __restrict__ k,
+                                   const std::int32_t* __restrict__ turns, int turned_from) {
     const int p = blockIdx.x, h = blockIdx.y, i = threadIdx.x, half = d >> 1;
     const std::int64_t at = h * head_stride + std::int64_t(p) * d;
-    const float2 cs = i < pairs ? rope[std::int64_t(p) * pairs + i] : make_float2(1.0f, 0.0f);
+    const int turn        = turns != nullptr && p >= turned_from ? turns[p - turned_from] : p;
+    const float2 cs = i < pairs ? rope[std::int64_t(turn) * pairs + i] : make_float2(1.0f, 0.0f);
     derived_key_pair(__half2float(v[at + i]), __half2float(v[at + i + half]), w[i], w[i + half],
                      cs, k[at + i], k[at + i + half]);
 }
@@ -808,32 +825,39 @@ __global__ void decode_combine_kernel(DecodeAttentionArgs a) {
     }
 }
 
-// h += rms_norm(o) * w_post; then the FFN inputs of the new h (see AttnResidualArgs).
+// h += rms_norm(o) * w_post; then the FFN inputs of the new h (see AttnResidualArgs). Every
+// operand is loaded before the first reduction: the reductions' barriers would otherwise hold each
+// load behind the reduction before it.
 __global__ void attn_residual_kernel(AttnResidualArgs a) {
     const int q = a.hidden >> 2, i = threadIdx.x;
     const std::int64_t row = std::int64_t(blockIdx.x) * a.hidden;
-    const float4 zero = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-    const float4 o    = i < q ? load_bf16x4(a.o + row + 4 * i) : zero;
+    const float4 zero         = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    const bool valid          = i < q;
+    const float4 o            = valid ? load_bf16x4(a.o + row + 4 * i) : zero;
+    const float4 h0           = valid ? ld4(a.h + row, i) : zero;
+    const float4 w_post       = valid ? ld4(a.w_post, i) : zero;
+    const float4 ffn_norm     = valid ? ld4(a.ffn_norm, i) : zero;
+    const float4 pre_norm     = valid && a.pre_norm != nullptr ? ld4(a.pre_norm, i) : zero;
+    const float4 router_scale = valid && a.router_x != nullptr ? ld4(a.router_scale, i) : zero;
     const float inv_o = rsqrtf(block_sum(dot4(o, o)) / float(a.hidden) + a.eps);
     float4 h = zero;
-    if (i < q) {
-        h = add4(ld4(a.h + row, i), mul4(scale4(o, inv_o), ld4(a.w_post, i)));
+    if (valid) {
+        h = add4(h0, mul4(scale4(o, inv_o), w_post));
         reinterpret_cast<float4*>(a.h + row)[i] = h;
     }
-    const float inv = rsqrtf(block_sum(dot4(h, h)) / float(a.hidden) + a.eps);
-    const bool valid = i < q;
+    const float inv  = rsqrtf(block_sum(dot4(h, h)) / float(a.hidden) + a.eps);
     const float4 n   = scale4(h, inv);
-    const float4 mlp = valid ? mul4(n, ld4(a.ffn_norm, i)) : zero;
+    const float4 mlp = valid ? mul4(n, ffn_norm) : zero;
     if (valid && a.mlp_in != nullptr) { store_bf16x4(a.mlp_in + row + 4 * i, mlp); }
     if (a.mlp_q.qs != nullptr) { store_q8x4(a.mlp_q, a.hidden, blockIdx.x, i, mlp, valid); }
     if (a.pre_norm != nullptr) {
-        const float4 moe = valid ? mul4(n, ld4(a.pre_norm, i)) : zero;
+        const float4 moe = valid ? mul4(n, pre_norm) : zero;
         if (valid && a.moe_in != nullptr) { store_bf16x4(a.moe_in + row + 4 * i, moe); }
         if (a.moe_q.qs != nullptr) { store_q8x4(a.moe_q, a.hidden, blockIdx.x, i, moe, valid); }
     }
     if (valid && a.router_x != nullptr) {
         reinterpret_cast<float4*>(a.router_x + row)[i] =
-            scale4(mul4(n, ld4(a.router_scale, i)), rsqrtf(float(a.hidden)));
+            scale4(mul4(n, router_scale), rsqrtf(float(a.hidden)));
     }
 }
 
@@ -1049,15 +1073,23 @@ __global__ void geglu_rows_kernel(const float* __restrict__ x, int pairs, int wi
     out[i]               = __float2bfloat16(gelu_tanh(row[r]) * row[width + r]);
 }
 
+// Every operand is loaded before the first reduction, as in attn_residual_kernel.
 __global__ void ffn_combine_kernel(FfnCombineArgs a) {
     const int q = a.hidden >> 2, i = threadIdx.x;
     const std::int64_t row = std::int64_t(blockIdx.x) * a.hidden;
     const float hidden = float(a.hidden);
     const float4 zero  = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-    float4 y = i < q ? load_bf16x4(a.dense + row + 4 * i) : zero;
-    const bool moe = a.moe_rows != nullptr || a.moe_fixed != nullptr;
-    float4 m       = zero;
-    if (moe && i < q) {
+    const bool valid   = i < q;
+    float4 y           = valid ? load_bf16x4(a.dense + row + 4 * i) : zero;
+    const bool moe     = a.moe_rows != nullptr || a.moe_fixed != nullptr;
+    const float4 w_dense = valid && a.w_dense != nullptr ? ld4(a.w_dense, i) : zero;
+    const float4 w_moe   = valid && moe ? ld4(a.w_moe, i) : zero;
+    const float4 h0      = valid ? ld4(a.h + row, i) : zero;
+    const float4 w_post  = valid ? ld4(a.w_post, i) : zero;
+    const float4 w_next  = valid && a.next_norm != nullptr ? ld4(a.next_norm, i) : zero;
+    const float scalar   = a.scalar[0];
+    float4 m             = zero;
+    if (moe && valid) {
         if (a.moe_rows != nullptr) {
             for (int k = 0; k < a.top_k; ++k) {
                 const std::int64_t pair = std::int64_t(blockIdx.x) * a.top_k + k;
@@ -1070,22 +1102,22 @@ __global__ void ffn_combine_kernel(FfnCombineArgs a) {
     if (a.w_dense != nullptr || moe) {
         // The dense and expert norms in one reduction.
         const float2 ss = block_sum2(dot4(y, y), dot4(m, m));
-        if (i < q) {
-            if (a.w_dense != nullptr) { y = mul4(scale4(y, rsqrtf(ss.x / hidden + a.eps)), ld4(a.w_dense, i)); }
-            if (moe) { y = add4(y, mul4(scale4(m, rsqrtf(ss.y / hidden + a.eps)), ld4(a.w_moe, i))); }
+        if (valid) {
+            if (a.w_dense != nullptr) { y = mul4(scale4(y, rsqrtf(ss.x / hidden + a.eps)), w_dense); }
+            if (moe) { y = add4(y, mul4(scale4(m, rsqrtf(ss.y / hidden + a.eps)), w_moe)); }
         }
     }
     const float inv_y = rsqrtf(block_sum(dot4(y, y)) / hidden + a.eps);
     float4 h = zero;
-    if (i < q) {
-        h = scale4(add4(ld4(a.h + row, i), mul4(scale4(y, inv_y), ld4(a.w_post, i))), a.scalar[0]);
+    if (valid) {
+        h = scale4(add4(h0, mul4(scale4(y, inv_y), w_post)), scalar);
         reinterpret_cast<float4*>(a.h + row)[i] = h;
     }
     if (a.next_norm == nullptr) { return; }
     const float inv  = rsqrtf(block_sum(dot4(h, h)) / hidden + a.eps);
-    const float4 nxt = i < q ? mul4(scale4(h, inv), ld4(a.next_norm, i)) : zero;
-    if (i < q && a.next_out != nullptr) { store_bf16x4(a.next_out + row + 4 * i, nxt); }
-    if (a.next_q.qs != nullptr) { store_q8x4(a.next_q, a.hidden, blockIdx.x, i, nxt, i < q); }
+    const float4 nxt = valid ? mul4(scale4(h, inv), w_next) : zero;
+    if (valid && a.next_out != nullptr) { store_bf16x4(a.next_out + row + 4 * i, nxt); }
+    if (a.next_q.qs != nullptr) { store_q8x4(a.next_q, a.hidden, blockIdx.x, i, nxt, valid); }
 }
 
 __global__ void add_fixed_kernel(unsigned long long* sums, const unsigned long long* products,
@@ -1161,9 +1193,10 @@ void qkv_post(const QkvArgs& args, cudaStream_t stream) {
 }
 
 void build_mask(__half* mask, int tokens, int slots, int first, int ring, int window,
-                cudaStream_t stream, const std::int32_t* blocks) {
+                cudaStream_t stream, const std::int32_t* blocks, const std::int32_t* starts) {
     const dim3 grid(blocks_for(slots, 256), tokens, 1);
-    build_mask_kernel<<<grid, 256, 0, stream>>>(mask, tokens, slots, first, ring, window, blocks);
+    build_mask_kernel<<<grid, 256, 0, stream>>>(mask, tokens, slots, first, ring, window, blocks,
+                                                starts);
     check_launch("build_mask");
 }
 
@@ -1354,10 +1387,10 @@ void rope_table(const float* inv_freq, int pairs, int positions, float2* rope, c
 
 void derive_keys(const __half* v, std::int64_t head_stride, int kv_heads, int head_dim, int count,
                  const float* k_norm, const float2* rope, int rope_pairs, __half* k,
-                 cudaStream_t stream) {
+                 cudaStream_t stream, const std::int32_t* turns, int turned_from) {
     if (count <= 0) { return; }
     derive_keys_kernel<<<dim3(count, kv_heads, 1), head_dim / 2, 0, stream>>>(
-        v, head_stride, head_dim, k_norm, rope, rope_pairs, k);
+        v, head_stride, head_dim, k_norm, rope, rope_pairs, k, turns, turned_from);
     check_launch("derive_keys");
 }
 

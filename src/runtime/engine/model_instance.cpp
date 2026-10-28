@@ -12,12 +12,14 @@
 #include "artifact/formats.h"
 #include "core/paged_kv_cache.h"
 #include "core/startup.h"
+#include "core/tensor_parallel.h"
 #include "models/qwen3_5/frontend/graft.h"
 #include "models/qwen3_5/load.h"
 #include "models/qwen3_5/execution/expert_runtime.h"
 #include "models/qwen3_5/expert_admission.h"
 #include "models/qwen3_5/measurement.h"
 #include "runtime/engine/host_memory.h"
+#include "runtime/contract/rope_scaling.h"
 
 #include <algorithm>
 #include <cmath>
@@ -655,7 +657,18 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
                             reader.directory().component("text").proposal.has_value();
         options.speculative.proposal_head = stored ? ProposalHead::Optimized : ProposalHead::Full;
     }
-    if (options.devices.size() > 1 && options.stage_layers.empty()) {
+    if (options.tensor_parallel && options.tensor_split.empty()) {
+        const std::vector<std::size_t> free_now = free_bytes_by_rank(device);
+        const std::vector<std::uint64_t> free_bytes(free_now.begin(), free_now.end());
+        const models::qwen3_5::StageSizing sizing{
+            .kv_storage = options.kv_cache,
+            .state_slots =
+                options.max_concurrency + options.context_cache.device_state_slots.value_or(0U),
+            .kv_tokens = std::uint64_t(options.max_context) * options.max_concurrency};
+        options.tensor_split = models::qwen3_5::default_tensor_split(
+            reader, models::load_options(options), sizing, free_bytes, rank_copy_bandwidth(device));
+    }
+    if (options.devices.size() > 1 && options.stage_layers.empty() && !options.tensor_parallel) {
         const std::vector<std::size_t> free_now = free_bytes_by_rank(device);
         const std::vector<std::uint64_t> free_bytes(free_now.begin(), free_now.end());
         const models::qwen3_5::StageSizing sizing{
@@ -851,6 +864,10 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
     summary.host_object_count    = stats.host_object_count;
     summary.context_cost         = std::move(context_cost.summary);
     summary.prefix_cache         = std::move(restore);
+    summary.rope                 = runtime::resolve_rope_scaling(
+                           options, instance->model->config().text.max_position_embeddings,
+                           runtime::kQwen35RopeScaling)
+                           .summary;
 
     // Static /v1/models metadata: the model identity and dimension facts come from the loaded
     // model; the parameters, weight bytes, and weights profile are pure functions of the

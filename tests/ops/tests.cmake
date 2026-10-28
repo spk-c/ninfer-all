@@ -36,6 +36,7 @@ set(ninfer_op_tests
   scatter
   scatter_bf16_batch
   target_logprobs
+  readout_logprobs
   paged_kv_window
   logprob_topk
   position)
@@ -81,6 +82,14 @@ add_test(NAME ninfer_softmax_attention_rk4v4_e8_test
   COMMAND ninfer_tests ninfer_softmax_attention_test --rk4v4-e8-only)
 add_test(NAME ninfer_softmax_attention_rk2v4_e8_test
   COMMAND ninfer_tests ninfer_softmax_attention_test --rk2v4-e8-only)
+# Tensor-parallel shares of the two model geometries, over every KV storage.
+add_test(NAME ninfer_softmax_attention_tensor_share_test
+  COMMAND ninfer_tests ninfer_softmax_attention_test --tensor-shares-only)
+# Position-split ranks (strided pages, partial outputs and their merge) and invariant reductions.
+add_test(NAME ninfer_softmax_attention_position_split_test
+  COMMAND ninfer_tests ninfer_softmax_attention_test --position-split-only)
+add_test(NAME ninfer_softmax_attention_invariant_test
+  COMMAND ninfer_tests ninfer_softmax_attention_test --invariant-only)
 
 # Upstream's DFlash2 verification sweep. ~460 s: six storage families (five upstream, plus this
 # fork's rk8v4) over every narrow width, batch and base offset, so it gets a timeout well clear of
@@ -131,6 +140,8 @@ set_tests_properties(
   ninfer_softmax_attention_small_t_pipelined_pv_f16_test
   ninfer_softmax_attention_fp8_prompt_test
   ninfer_softmax_attention_pack_gqa_test
+  ninfer_softmax_attention_position_split_test
+  ninfer_softmax_attention_invariant_test
   PROPERTIES SKIP_RETURN_CODE 77)
 
 ninfer_add_op_test(ninfer_sliding_window_attention_test
@@ -174,6 +185,9 @@ ninfer_add_op_test(ninfer_sparse_moe_test
 add_test(NAME ninfer_sparse_moe_streaming_test
   COMMAND ninfer_tests ninfer_sparse_moe_test --streaming)
 set_tests_properties(ninfer_sparse_moe_streaming_test PROPERTIES SKIP_RETURN_CODE 77)
+add_test(NAME ninfer_sparse_moe_shares_test
+  COMMAND ninfer_tests ninfer_sparse_moe_test --shares)
+set_tests_properties(ninfer_sparse_moe_shares_test PROPERTIES SKIP_RETURN_CODE 77)
 
 ninfer_add_op_test(ninfer_sparse_moe_candidates_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_sparse_moe_candidates.cpp"
@@ -226,6 +240,11 @@ ninfer_add_op_test(ninfer_gdn_input_proj_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gdn_input_proj.cpp"
   LIBRARIES ninfer_ops)
 
+# The part form over BF16 and row-split parts (a tensor-parallel rank's q/k/value and z rows).
+ninfer_add_op_test(ninfer_gdn_input_proj_parts_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gdn_input_proj_parts.cpp"
+  LIBRARIES ninfer_ops)
+
 ninfer_add_op_test(ninfer_gdn_input_small_t_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gdn_input_small_t.cpp"
   LIBRARIES ninfer_ops)
@@ -248,6 +267,10 @@ ninfer_add_op_test(ninfer_gdn_input_proj_conv_snapshot_test
 
 ninfer_add_op_test(ninfer_gdn_input_proj_conv_record_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gdn_input_proj_conv_record.cpp"
+  LIBRARIES ninfer_ops)
+
+ninfer_add_op_test(ninfer_gdn_projected_conv_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gdn_projected_conv.cpp"
   LIBRARIES ninfer_ops)
 
 ninfer_add_op_test(ninfer_gated_delta_net_replay_record_test

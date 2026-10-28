@@ -343,6 +343,13 @@ Json vision_workspace_json(const std::optional<ninfer::VisionWorkspaceMemorySumm
                 {"handoff_peak_bytes", vision->handoff_peak_bytes}};
 }
 
+Json rope_json(const ninfer::RopeScalingSummary& rope) {
+    const char* type = rope.type == ninfer::RopeScalingType::Yarn            ? "yarn"
+                       : rope.type == ninfer::RopeScalingType::Interpolation ? "interpolation"
+                                                                             : "none";
+    return Json{{"type", type}, {"factor", rope.factor}, {"native_context", rope.native_context}};
+}
+
 Json speculative_json(const GenerationMetrics& metrics) {
     Json out{{"backend", product::speculative_backend_name(metrics.speculative_backend)},
              {"draft_window", metrics.speculative_draft_window},
@@ -798,12 +805,15 @@ std::string format_server_start_json(
         {"lm_head_q6", engine_options.lm_head_q6},
         {"embedding_q4", engine_options.embedding_q4},
         {"embedding_q6", engine_options.embedding_q6},
+        {"embedding_residency",
+         engine_options.embedding_residency == EmbeddingResidency::Host ? "host" : "device"},
         {"mtp_experts_q4", engine_options.mtp_experts_q4},
         {"gdn_state_fp16", engine_options.gdn_state_fp16},
         {"rope_yarn", engine_options.rope_yarn},
         {"rope_yarn_factor", engine_options.rope_yarn_factor},
         {"rope_scaling_factor", engine_options.rope_scaling_factor},
         {"rope_scaling_original_context", engine_options.rope_scaling_original_context},
+        {"rope", rope_json(load.rope)},
         {"structured_output", engine_options.structured_output},
         {"concurrent_prefill", engine_options.concurrent_prefill},
         {"recover_invariant_failures", engine_options.recover_invariant_failures},

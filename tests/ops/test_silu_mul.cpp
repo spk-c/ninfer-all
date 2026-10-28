@@ -67,6 +67,31 @@ int run_contiguous_case(const char* label, std::int32_t rows, std::int32_t colum
     return failures;
 }
 
+// Unrounded FP32 gate and up, as a runtime-shape gate/up pair hands them over (linear_swiglu).
+int run_fp32_case(std::int32_t rows, std::int32_t columns, std::uint32_t seed) {
+    const std::size_t count = static_cast<std::size_t>(rows) * columns;
+    std::vector<float> gate(count), up(count);
+    fill_uniform(gate, seed, -12.0f, 12.0f);
+    fill_uniform(up, seed + 1, -8.0f, 8.0f);
+    const auto expected = silu_mul_oracle(gate, up);
+    GuardedDeviceBuffer device_gate(count * sizeof(float));
+    GuardedDeviceBuffer device_up(count * sizeof(float));
+    GuardedDeviceBuffer device_out(count * sizeof(std::uint16_t));
+    device_gate.copy_from_host(gate.data(), device_gate.bytes());
+    device_up.copy_from_host(up.data(), device_up.bytes());
+    Tensor gate_tensor(device_gate.data(), DType::FP32, {rows, columns});
+    Tensor up_tensor(device_up.data(), DType::FP32, {rows, columns});
+    Tensor out_tensor(device_out.data(), DType::BF16, {rows, columns});
+    ops::silu_mul(gate_tensor, up_tensor, out_tensor, nullptr);
+    cuda_synchronize();
+    int failures = verify_pointwise("silu_mul FP32 inputs", from_device_bf16(device_out.data(), count),
+                                    expected, silu_mul_bf16_criterion());
+    failures += device_gate.verify_guards("silu_mul FP32 gate");
+    failures += device_up.verify_guards("silu_mul FP32 up");
+    failures += device_out.verify_guards("silu_mul FP32 out");
+    return failures;
+}
+
 int run_strided_gate_up_case() {
     constexpr std::int32_t rows    = 17408;
     constexpr std::int32_t columns = 17;
@@ -150,11 +175,11 @@ int main() {
     int failures = 0;
     failures += run_contiguous_case("silu_mul [17408,1]", 17408, 1, 101u);
     failures += run_contiguous_case("silu_mul [17408,48]", 17408, 48, 102u);
-    // The opt-in Ada pack path must agree with the FP64 oracle at pack boundaries;
-    // its BF16x2 fallback must still handle the odd tail.
+    // Opt-in SM89 BF16x8 route and BF16x2 odd-tail fallback against the FP64 oracle.
     failures += run_contiguous_case("silu_mul [8,1]", 8, 1, 103u);
     failures += run_contiguous_case("silu_mul [9,1]", 9, 1, 104u);
     failures += run_contiguous_case("silu_mul [17415,1]", 17415, 1, 105u);
+    failures += run_fp32_case(4352, 3, 103u);
     failures += run_strided_gate_up_case();
     failures += run_edge_case();
     std::cout << (failures ? "FAIL" : "OK") << " silu_mul\n";

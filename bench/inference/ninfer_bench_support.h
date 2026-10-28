@@ -3,7 +3,13 @@
 // Host-only support for the product throughput benchmark. The benchmark itself drives only the
 // public ninfer::Engine API; this file owns its CLI, matrix, statistics, and report schema.
 
-#include "ninfer/types.h"
+#include "ninfer/base.h"
+#include "ninfer/engine_options.h"
+#include "ninfer/kv_cache_storage.h"
+#include "ninfer/model_enums.h"
+#include "ninfer/observability/execution.h"
+#include "ninfer/observability/resources.h"
+#include "ninfer/observability/snapshot.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -66,7 +72,9 @@ struct BenchOptions {
     KvCacheStorage kv_cache     = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
     ExpertResidency expert_residency = ExpertResidency::Device;
+    EmbeddingResidency embedding_residency = EmbeddingResidency::Device;
     std::optional<std::uint64_t> expert_cache_bytes;
+    HybridExpertOptions hybrid_experts; // --expert-dma-share, --expert-cpu-threads
     int device            = 0;
     bool use_cuda_graph   = true;
     bool prefill_a8       = true;
@@ -115,6 +123,7 @@ struct BenchEnvironment {
     KvCacheStorage kv_cache     = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
     ExpertResidency expert_residency = ExpertResidency::Device;
+    EmbeddingResidency embedding_residency = EmbeddingResidency::Device;
     // Routed-expert delivery counters over the whole run (warmups included), host/disk only.
     ExpertResidencyStats experts;
     bool use_cuda_graph                            = true;

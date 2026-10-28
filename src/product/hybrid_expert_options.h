@@ -1,6 +1,6 @@
 #pragma once
 
-#include "ninfer/types.h"
+#include "ninfer/engine_options.h"
 
 #include <charconv>
 #include <cmath>
@@ -16,8 +16,9 @@ inline constexpr const char* kHybridExpertHelp =
     "                                misses, 0..1; the CPU computes the rest (GGUF and\n"
     "                                Qwen3.5/3.6 MoE experts: the GPU's results bit for bit).\n"
     "                                auto (default): those split each call by measured CPU\n"
-    "                                and bus times, Flash-Next native experts copy every miss.\n"
-    "                                Flash-Next and Gemma 4 calls of more than 8 tokens, and\n"
+    "                                and bus times, Flash-Next native experts and DeepSeek-V4.1\n"
+    "                                disk experts copy every miss. Flash-Next, Gemma 4, Flint\n"
+    "                                and DeepSeek-V4.1 calls of more than 8 tokens, and\n"
     "                                Qwen3.5/3.6 calls routed to half the experts or more,\n"
     "                                always use the GPU\n"
     "  --expert-cpu-threads N        CPU workers, 1..256 (default: one per physical core, at\n"

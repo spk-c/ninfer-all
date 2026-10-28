@@ -1,11 +1,13 @@
 #pragma once
 
 #include "core/arena.h"
+#include "core/host_pages.h"
 #include "core/startup.h"
 #include "models/qwen3_5/program/prefix/hybrid_host_layout.h"
 #include "models/qwen3_5/program/storage/kv_store.h"
 #include "models/qwen3_5/program/storage/state_store.h"
 #include "models/qwen3_5/state/state_image.h"
+#include "ninfer/types_fwd.h"
 #include "runtime/prefix_cache/prefix_index.h"
 #include "runtime/prefix_cache/tap_planner.h"
 
@@ -15,6 +17,7 @@
 #include <cstdint>
 #include <deque>
 #include <filesystem>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -305,7 +308,7 @@ private:
     // can fail or stall on Windows (WDDM) where several smaller ones succeed. A slab never
     // crosses chunks, and every copy record carries its chunk as its group, so a strided copy
     // run never spans two chunks (two records of different chunks would otherwise form a run).
-    std::vector<PinnedHostBuffer> host_chunks_;
+    std::vector<std::unique_ptr<HostPages>> host_chunks_;
     std::uint32_t slabs_per_chunk_ = 0;
     cudaStream_t restore_stream_   = nullptr;
     std::vector<std::optional<HybridBlockPages>> blocks_;

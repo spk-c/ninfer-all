@@ -18,27 +18,29 @@ what those builds change.
 
 ## Container image
 
-The published image, `ghcr.io/iamwavecut/ninfer-all:latest`, is the shortest path on any Linux
-distribution: CUDA 13.4 on Ubuntu 26.04, with an `sm_75` build for Turing, an `sm_86` build for the
-RTX 30 and 40 series and an `sm_120a` build for Blackwell, and it starts the one that matches the
-GPU. It needs a
-driver of the CUDA 13 branch (580 or newer) and the NVIDIA Container Toolkit; make sure that Docker
-can access the GPU first:
+The release pipeline packages Debian 13 images from prebuilt Linux binaries:
+
+- `ghcr.io/iamwavecut/ninfer-all:cuda12.9`: CUDA 12.9.2 with `70;75;80;86;89`, including Volta.
+- `ghcr.io/iamwavecut/ninfer-all:cuda13.4`: CUDA 13.4.3 with `75;80;86;89;120a`, including Blackwell.
+
+Each image carries all listed architectures in one executable. Both support mixed-GPU pipelines
+within their architecture set. Choose the variant for your GPUs and installed NVIDIA driver.
+The host also needs NVIDIA Container Toolkit. For a CUDA 13 host, first check GPU access:
 
 ```bash
-docker run --rm --gpus all nvidia/cuda:13.4.2-base-ubuntu26.04 nvidia-smi
+docker run --rm --gpus all nvidia/cuda:13.4.3-base-ubuntu26.04 nvidia-smi
 ```
 
 Download and serve the Qwen3.8 model with the measured `tuned` profile:
 
 ```bash
-docker run --rm -v "$PWD/models:/models" ghcr.io/iamwavecut/ninfer-all download qwen38-27b
+docker run --rm -v "$PWD/models:/models" ghcr.io/iamwavecut/ninfer-all:cuda13.4 download qwen38-27b
 docker run --rm --gpus all -p 8080:8080 --ulimit memlock=-1 \
-  -v "$PWD/models:/models" ghcr.io/iamwavecut/ninfer-all run qwen38-27b
+  -v "$PWD/models:/models" ghcr.io/iamwavecut/ninfer-all:cuda13.4 run qwen38-27b
 ```
 
 The API is available at `http://127.0.0.1:8080/v1`. `docker build --build-arg ARCHS=86 -t ninfer .`
-builds the same image from source with the `sm_86` build alone; the [README](../README.md#docker)
+builds a separate Ubuntu image from source with the `sm_86` build alone; the [README](../README.md#docker)
 covers the container's commands, volumes and compose file, and the [launch recipes](recipes.md)
 the command for each published artifact.
 
@@ -197,10 +199,16 @@ speed, and the kernels written for Ampere everywhere else, on emulated warp prim
   here, stays A16.
 - **Weight layout**: the row-split projection weights of the text and MTP layers (T2, Q2, Q4, Q5,
   Q6) load in the panel layout, four rows' records of a group per 128-byte line, which the
-  decode reads stream at a larger share of the card's bandwidth.
+  decode reads stream at a larger share of the card's bandwidth. A tensor-parallel rank's pieces
+  of them take it too, each permuted after its upload, and its FP32 partial sums run the same
+  Volta routes.
 - **GGUF projections** keep NInfer's DP4A vector kernel up to eight columns and ggml's DP4A matrix
   kernel above (as llama.cpp does on Volta); GGUF dense projections from 65 columns take the cuBLAS
-  route.
+  route. The routed experts' matrix products (prompt chunks of Flash-Next, Gemma 4, Flint and
+  DeepSeek) run on the FP16 tensor cores instead of `dp4a`: each lane decodes its row's GGUF slices
+  into FP16 fragments, and the activation is an FP16 plane with one power-of-two factor per column,
+  which keeps BF16's range (`ggml_bridge_sm70.cuh`). Gemma 4 26B-A4B QAT on one Tesla V100-SXM2
+  prefills a 9,705-token prompt at 3,422 tok/s against 2,499 with `dp4a` (+37%; 2026-10-27).
 - **Attention** of every KV format runs on Volta's tensor cores with FP32 accumulation. Decode and
   verification use a Volta kernel that decodes each format's keys and values to FP16 as it loads
   them (32 dimensions of a quantized row a load), with the same fused append, splits and reducers
@@ -293,9 +301,11 @@ The launcher uses `build-linux/apps/ninfer-serve` when the executable is not bes
 Set `NINFER_SERVER` to select another executable. Profiles and the measurements behind them are in
 [launcher profiles](maintainer/launcher-profiles.md).
 
-`scripts/package-release.sh` creates the Linux `tar.gz` archive for the release named in `VERSION`,
-and `scripts/package-release.ps1` the Windows ZIP; `build.sh --package` and `build.ps1 -Package` run
-them after a build ([cutting a release](maintainer/release-process.md)).
+`scripts/package-release.sh` creates split Linux `tar.gz` volumes; `scripts/package-release.ps1`
+creates Windows 7-Zip volumes. Names contain the platform, CUDA minor version, architecture list
+and source commit; `BUILD-INFO.json` records the version. `build.sh --package` and `build.ps1 -Package`
+run the packagers after a build. The Native release workflow builds Debian 13 and Windows packages
+with CUDA 12.9.2 and 13.4.3. See [cutting a release](maintainer/release-process.md).
 
 ## Validation
 

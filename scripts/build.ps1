@@ -19,7 +19,7 @@
 #
 #   .\scripts\build.ps1                  configure + build into build-ninja
 #   .\scripts\build.ps1 -Test            ... then run the test suite
-#   .\scripts\build.ps1 -Package         ... then build the release archive for VERSION
+#   .\scripts\build.ps1 -Package         ... then build the release archive for this source commit
 #   .\scripts\build.ps1 -Benchmarks      ... include bench\ (implied by -Package)
 #   .\scripts\build.ps1 -Clean           delete the build directory first
 #   .\scripts\build.ps1 -Target ninfer-serve
@@ -130,6 +130,7 @@ Push-Location $RepoRoot
 try {
     # Quote the -D arguments: PowerShell does not reliably expand a variable inside a bare token
     # that begins with "-D", and cmake then sees the literal "$Arch".
+    $RuntimeOption = if ($Package) { 'ON' } else { 'OFF' }
     $BenchmarksOption = if ($BuildBenchmarks) { 'ON' } else { 'OFF' }
     $TestsOption = if ($Test) { 'ON' } else { 'OFF' }
     $SfuOption = if ($ExperimentalFastSfu) { 'ON' } else { 'OFF' }
@@ -138,14 +139,15 @@ try {
     cmake -S . -B $BuildDir -G Ninja '-DCMAKE_BUILD_TYPE=Release' "-DCMAKE_CUDA_ARCHITECTURES=$Arch" `
           "-DCMAKE_RC_COMPILER=$RcCmake" `
           "-DCMAKE_TOOLCHAIN_FILE=$VcpkgToolchain" '-DVCPKG_TARGET_TRIPLET=x64-windows' `
-          "-DNINFER_BUILD_BENCHMARKS=$BenchmarksOption" "-DBUILD_TESTING=$TestsOption" `
+          "-DNINFER_BUILD_BENCHMARKS=$BenchmarksOption" "-DNINFER_SHARED_RUNTIME=$RuntimeOption" `
+          "-DBUILD_TESTING=$TestsOption" `
           "-DNINFER_SFU_SIGMOID_SILU=$SfuOption" "-DNINFER_SFU_SOFTPLUS=$SfuOption" `
           "-DNINFER_ADA_SILU_BF16X8=$VectorSiluOption" `
           "-DNINFER_ADA_GGUF_IQ3S_T6_LOOP=$GgufIq3sT6LoopOption"
     if ($LASTEXITCODE -ne 0) { throw "configure failed ($LASTEXITCODE)" }
 
-    $buildArgs = @('--build', $BuildDir, '-j')
-    if ($Jobs) { $buildArgs += $Jobs }
+    $buildArgs = @('--build', $BuildDir)
+    if ($Jobs) { $buildArgs += @('--parallel', [string]$Jobs) }
     if ($Target) { $buildArgs += @('--target', $Target) }
     cmake @buildArgs
     if ($LASTEXITCODE -ne 0) { throw "build failed ($LASTEXITCODE)" }

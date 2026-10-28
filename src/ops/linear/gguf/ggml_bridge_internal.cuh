@@ -55,6 +55,13 @@ void moe_matrix_product_impl(const void* const* experts, std::int64_t row_bytes,
                              const MoeRouting& routing, int max_active, int pairs, bool tail,
                              const void* activation, float* out, cudaStream_t stream);
 
+// Volta's form of moe_matrix_product (ggml_bridge_sm70.cuh): FP16 tensor-core products over the
+// FP16 activation plane of moe_sm70_activation, whose columns are k_padded values apart.
+template <ggml_type type>
+void moe_matrix_sm70_launch(const void* const* experts, std::int64_t row_bytes, int rows, int k,
+                            int k_padded, const MoeRouting& routing, int max_active, int pairs,
+                            const void* activation, float* out, cudaStream_t stream);
+
 // Where and how the vector kernel (ggml_bridge_vec.cuh) writes its rows.
 struct VecStore {
     __nv_bfloat16* bf16;
@@ -148,10 +155,10 @@ __device__ __forceinline__ void vec_store(const VecStore& out, int row, int colu
     out.bf16[at] = __float2bfloat16(value);
 }
 
-template <ggml_type type>
+template <ggml_type type, typename Dst = float, bool accumulate = false>
 void matrix_product_impl(const void* weight, std::int64_t row_bytes, int rows, int k,
-                         const void* activation, int columns, float* out,
+                         const void* activation, int columns, Dst* out,
                          std::int64_t out_column_stride, void* fixup, cudaStream_t stream,
-                         bool tail);
+                         bool tail, float* partial = nullptr);
 
 } // namespace ninfer::ops::gguf::detail

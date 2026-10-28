@@ -60,6 +60,8 @@ ParameterReference Binder::binding(std::string name, const Binding& binding, Sha
             require_device(part.object);
         } else if (residency == Residency::Pinned) {
             require_pinned(part.object);
+        } else if (residency == Residency::Mapped) {
+            require_mapped(part.object);
         } else if (residency == Residency::Host || residency == Residency::Registered) {
             (void)host_object(part.object);
             if (residency == Residency::Registered) { demands_[part.object.index].registered = true; }
@@ -80,6 +82,52 @@ bool Binder::contains(std::string_view parameter) const {
     return reader_.directory().bindings.contains(parameter);
 }
 
+ObjectHandle Binder::select_device(ObjectHandle source, ObjectSelection selection,
+                                   std::size_t rank) {
+    if (selected(source)) { throw ArtifactError("a selection cannot select from another one"); }
+    reader_.validate_object(source);
+    const auto& stored = reader_.geometry(source);
+    Selected entry{.source    = source,
+                   .selection = std::move(selection),
+                   .geometry  = {},
+                   .rank      = rank,
+                   .alignment = std::max<std::uint64_t>(256, stored.alignment)};
+    entry.geometry = selected_geometry(stored, entry.selection);
+    selected_.push_back(std::move(entry));
+    return ObjectHandle{demands_.size() + selected_.size() - 1};
+}
+
+Binder::Selected& Binder::selected_entry(ObjectHandle object) {
+    if (!selected(object) || object.index - demands_.size() >= selected_.size()) {
+        throw ArtifactError("unknown selected object");
+    }
+    return selected_[object.index - demands_.size()];
+}
+
+WeightGeometry Binder::geometry(ObjectHandle object) const {
+    if (!selected(object)) { return reader_.geometry(object); }
+    if (object.index - demands_.size() >= selected_.size()) {
+        throw ArtifactError("unknown selected object");
+    }
+    return selected_[object.index - demands_.size()].geometry;
+}
+
+std::string Binder::object_id(ObjectHandle object) const {
+    if (!selected(object)) { return artifact::object_id(reader_.directory().object(object)); }
+    if (object.index - demands_.size() >= selected_.size()) {
+        throw ArtifactError("unknown selected object");
+    }
+    const Selected& entry = selected_[object.index - demands_.size()];
+    std::string id = artifact::object_id(reader_.directory().object(entry.source)) + "[";
+    for (const auto& [begin, end] : entry.selection.rows) {
+        id += (id.back() == '[' ? "" : ";") + std::to_string(begin) + ":" + std::to_string(end);
+    }
+    for (const auto& [begin, end] : entry.selection.columns) {
+        id += "," + std::to_string(begin) + ":" + std::to_string(end);
+    }
+    return id + "]";
+}
+
 void Binder::require_device(ObjectHandle object, std::uint64_t alignment) {
     const auto& geometry = reader_.geometry(object);
     if (!alignment || (alignment & (alignment - 1))) {
@@ -91,6 +139,11 @@ void Binder::require_device(ObjectHandle object, std::uint64_t alignment) {
 }
 
 void Binder::device_tail(ObjectHandle object, std::uint64_t bytes) {
+    if (selected(object)) {
+        auto& entry = selected_entry(object);
+        entry.tail  = std::max(entry.tail, bytes);
+        return;
+    }
     auto& demand = demands_.at(object.index);
     if (!demand.device) {
         throw ArtifactError(reader_.directory().tensor(object).id +
@@ -100,6 +153,9 @@ void Binder::device_tail(ObjectHandle object, std::uint64_t bytes) {
 }
 
 void Binder::transcode_device(ObjectHandle object, QType target) {
+    if (selected(object)) {
+        throw ArtifactError(object_id(object) + ": a selected piece cannot be transcoded");
+    }
     const auto& geometry = reader_.geometry(object);
     const auto& tensor   = reader_.directory().tensor(object);
     auto& demand         = demands_.at(object.index);
@@ -120,6 +176,16 @@ void Binder::transcode_device(ObjectHandle object, QType target) {
 }
 
 void Binder::panel_device(ObjectHandle object) {
+    if (selected(object)) {
+        // A piece is uploaded in the stored row-split layout and permuted in place, as a whole
+        // object is.
+        auto& entry = selected_entry(object);
+        if (!row_split_panel_supported(entry.geometry)) {
+            throw ArtifactError(object_id(object) + ": object cannot take the panel layout");
+        }
+        entry.panel = true;
+        return;
+    }
     const auto& tensor = reader_.directory().tensor(object);
     auto& demand       = demands_.at(object.index);
     if (!demand.device) {
@@ -132,6 +198,9 @@ void Binder::panel_device(ObjectHandle object) {
 }
 
 void Binder::evict_device(ObjectHandle object, std::uint32_t rank) {
+    if (selected(object)) {
+        throw ArtifactError(object_id(object) + ": a selected piece cannot be evictable");
+    }
     const auto& tensor = reader_.directory().tensor(object);
     auto& demand       = demands_.at(object.index);
     if (!demand.device) {
@@ -142,6 +211,12 @@ void Binder::evict_device(ObjectHandle object, std::uint32_t rank) {
 }
 
 void Binder::device_rank(ObjectHandle object, std::size_t rank) {
+    if (selected(object)) {
+        if (selected_entry(object).rank != rank) {
+            throw ArtifactError(object_id(object) + ": conflicting pipeline ranks");
+        }
+        return;
+    }
     const auto& tensor = reader_.directory().tensor(object);
     auto& demand       = demands_.at(object.index);
     if (!demand.device) {
@@ -160,6 +235,13 @@ void Binder::require_pinned(ObjectHandle object) {
     auto& demand         = demands_.at(object.index);
     demand.alignment     = std::max(demand.alignment, geometry.alignment);
     if (!demand.pinned_order) { demand.pinned_order = next_pinned_order_++; }
+}
+
+void Binder::require_mapped(ObjectHandle object) {
+    const auto& geometry = reader_.geometry(object);
+    auto& demand         = demands_.at(object.index);
+    demand.alignment     = std::max(demand.alignment, geometry.alignment);
+    demand.mapped        = true;
 }
 
 std::span<const std::byte> Binder::host_object(ObjectHandle object) {
@@ -235,6 +317,7 @@ MaterializationPlan Binder::finish(std::uint64_t evictable_alignment) && {
     MaterializationPlan plan;
     plan.source            = &reader_;
     plan.object_count      = demands_.size();
+    plan.selected_count    = selected_.size();
     plan.prior_read_bytes  = read_bytes_;
     plan.owned_value_bytes = owned_value_bytes_;
     const auto device_bytes = [&](std::size_t index) {
@@ -251,6 +334,7 @@ MaterializationPlan Binder::finish(std::uint64_t evictable_alignment) && {
             rank_count = std::max(rank_count, *demand.device_rank + 1);
         }
     }
+    for (const auto& entry : selected_) { rank_count = std::max(rank_count, entry.rank + 1); }
     plan.device_capacity_by_rank.assign(rank_count, 0);
     const auto place_device = [&](std::size_t index) {
         const auto& demand  = demands_[index];
@@ -265,6 +349,7 @@ MaterializationPlan Binder::finish(std::uint64_t evictable_alignment) && {
     };
     std::vector<std::size_t> evictable;
     std::vector<std::size_t> pinned;
+    std::vector<std::size_t> mapped;
     // Placements are emitted rank by rank so each rank's offsets stay ascending, which is what
     // materialization validates. Rank 0 first keeps a single-device plan byte-for-byte what it was.
     std::vector<std::vector<std::size_t>> resident(rank_count);
@@ -274,7 +359,13 @@ MaterializationPlan Binder::finish(std::uint64_t evictable_alignment) && {
             throw ArtifactError(reader_.directory().tensor(ObjectHandle{i}).id +
                                 ": a pinned object cannot also have device or Host placement");
         }
+        if (demand.mapped && (demand.device || demand.host || demand.pinned_order)) {
+            throw ArtifactError(reader_.directory().tensor(ObjectHandle{i}).id +
+                                ": a mapped object cannot also have device, Host or pinned "
+                                "placement");
+        }
         if (demand.pinned_order) { pinned.push_back(i); }
+        if (demand.mapped) { mapped.push_back(i); }
         if (!demand.device) { continue; }
         if (demand.evict_rank != 0) {
             // The evictable tail exists so a Vision encode window can borrow weight memory on the
@@ -289,7 +380,28 @@ MaterializationPlan Binder::finish(std::uint64_t evictable_alignment) && {
             resident[demand.device_rank.value_or(0)].push_back(i);
         }
     }
+    // Selected pieces follow their rank's stored objects; on rank 0 they stay ahead of the
+    // evictable tail.
+    const auto place_selected = [&](std::size_t rank) {
+        for (std::size_t i = 0; i < selected_.size(); ++i) {
+            const Selected& entry = selected_[i];
+            if (entry.rank != rank) { continue; }
+            auto& capacity    = plan.device_capacity_by_rank[rank];
+            const auto offset = align_up(capacity, entry.alignment, "device offset");
+            DevicePlacement placement{ObjectHandle{demands_.size() + i}, offset,
+                                      entry.geometry.bytes, entry.alignment};
+            placement.rank      = rank;
+            placement.tail      = entry.tail;
+            placement.source    = entry.source;
+            placement.selection = entry.selection;
+            placement.panel     = entry.panel;
+            plan.device_objects.push_back(std::move(placement));
+            capacity = checked_add(checked_add(offset, entry.geometry.bytes, "device capacity"),
+                                   entry.tail, "device capacity");
+        }
+    };
     for (const std::size_t index : resident[0]) { place_device(index); }
+    place_selected(0);
     if (!evictable.empty()) {
         std::stable_sort(evictable.begin(), evictable.end(), [&](std::size_t a, std::size_t b) {
             return demands_[a].evict_rank < demands_[b].evict_rank;
@@ -302,6 +414,7 @@ MaterializationPlan Binder::finish(std::uint64_t evictable_alignment) && {
     }
     for (std::size_t rank = 1; rank < rank_count; ++rank) {
         for (const std::size_t index : resident[rank]) { place_device(index); }
+        place_selected(rank);
     }
     std::sort(pinned.begin(), pinned.end(), [&](std::size_t a, std::size_t b) {
         return *demands_[a].pinned_order < *demands_[b].pinned_order;
@@ -314,6 +427,15 @@ MaterializationPlan Binder::finish(std::uint64_t evictable_alignment) && {
             align_up(plan.pinned_capacity_bytes, demand.alignment, "pinned Host offset");
         plan.pinned_objects.push_back({handle, offset, bytes, demand.alignment});
         plan.pinned_capacity_bytes = checked_add(offset, bytes, "pinned Host capacity");
+    }
+    for (const std::size_t index : mapped) {
+        const ObjectHandle handle{index};
+        const auto& demand = demands_[index];
+        const auto bytes   = reader_.geometry(handle).bytes;
+        const auto offset =
+            align_up(plan.mapped_capacity_bytes, demand.alignment, "mapped Host offset");
+        plan.mapped_objects.push_back({handle, offset, bytes, demand.alignment});
+        plan.mapped_capacity_bytes = checked_add(offset, bytes, "mapped Host capacity");
     }
     for (std::size_t i = 0; i < demands_.size(); ++i) {
         if (demands_[i].host) {

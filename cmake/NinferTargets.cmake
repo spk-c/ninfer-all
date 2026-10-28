@@ -17,6 +17,25 @@ if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.8)
   list(APPEND NINFER_CUDA_FATBIN_OPTIONS "-compress-mode=size")
 endif()
 
+if(NINFER_CUDA_PRUNE_PTX)
+  get_filename_component(_ninfer_cuda_bin "${CMAKE_CUDA_COMPILER}" DIRECTORY)
+  find_program(NINFER_NVPRUNE nvprune HINTS "${_ninfer_cuda_bin}" REQUIRED)
+endif()
+
+function(ninfer_prune_cuda_ptx target)
+  get_target_property(_ninfer_library_type ${target} TYPE)
+  if(NINFER_CUDA_PRUNE_PTX AND _ninfer_library_type STREQUAL "STATIC_LIBRARY")
+    # Archive-only processing preserves compiler-cache entries and all selected GPU targets.
+    add_custom_command(TARGET ${target} POST_BUILD
+      COMMAND ${CMAKE_COMMAND}
+        "-DNVPRUNE=${NINFER_NVPRUNE}"
+        "-DARCHIVE=$<TARGET_FILE:${target}>"
+        "-DARCHITECTURES=$<TARGET_PROPERTY:${target},CUDA_ARCHITECTURES>"
+        -P "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/PruneCudaPtx.cmake"
+      VERBATIM)
+  endif()
+endfunction()
+
 # Whole-program device code: every device symbol is defined and used in one translation unit (no
 # extern __device__ or __constant__, no cross-unit device calls), and relocatable device code made
 # ptxas assume external linkage, lower computed-lane shuffles to out-of-line calls and give up
@@ -27,6 +46,7 @@ function(ninfer_cuda_archive target)
   endif()
   target_compile_options(${target} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>
     "$<$<COMPILE_LANGUAGE:CUDA>:${NINFER_CUDA_FATBIN_OPTIONS}>")
+  ninfer_prune_cuda_ptx(${target})
 endfunction()
 
 function(ninfer_cuda_non_rdc_archive target)
@@ -38,6 +58,31 @@ function(ninfer_cuda_non_rdc_archive target)
   endif()
   target_compile_options(${target} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>
     "$<$<COMPILE_LANGUAGE:CUDA>:${NINFER_CUDA_FATBIN_OPTIONS}>")
+  ninfer_prune_cuda_ptx(${target})
+endfunction()
+
+# Links a static archive whole into a Windows DLL and exports the `expected` explicit
+# instantiations of the function template `symbol` it defines, and nothing else of it. Automatic
+# exports (WINDOWS_EXPORT_ALL_SYMBOLS) read only the DLL's own objects; CMake merges this
+# module-definition file into them. The archive's sources stay as every other build compiles them.
+# The archive's own link step writes the file. As the output of a custom command of the DLL, it
+# would make Ninja compile the archive before any object of a target that links the DLL.
+function(ninfer_export_archive_instantiations dll archive symbol expected)
+  get_filename_component(_ninfer_linker_dir "${CMAKE_LINKER}" DIRECTORY)
+  find_program(NINFER_DUMPBIN dumpbin HINTS "${_ninfer_linker_dir}" REQUIRED)
+  set(_ninfer_definitions "${CMAKE_CURRENT_BINARY_DIR}/${archive}_exports.def")
+  add_custom_command(TARGET ${archive} POST_BUILD
+    COMMAND ${CMAKE_COMMAND}
+      "-DDUMPBIN=${NINFER_DUMPBIN}"
+      "-DARCHIVE=$<TARGET_FILE:${archive}>"
+      "-DSYMBOL=${symbol}"
+      "-DEXPECTED=${expected}"
+      "-DOUTPUT=${_ninfer_definitions}"
+      -P "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/ArchiveExports.cmake"
+    BYPRODUCTS "${_ninfer_definitions}"
+    VERBATIM)
+  target_sources(${dll} PRIVATE "${_ninfer_definitions}")
+  target_link_libraries(${dll} PRIVATE "$<LINK_LIBRARY:WHOLE_ARCHIVE,${archive}>")
 endfunction()
 
 # Runtime DLL staging for the apps and tests.
@@ -54,6 +99,9 @@ endfunction()
 # Collect the FFMPEG + libcurl runtime DLLs from the vcpkg bin tree into <out_var>.
 function(ninfer_runtime_dll_list out_var)
   set(_list "")
+  if(WIN32 AND NINFER_WINDOWS_KERNEL_DLL AND TARGET ninfer_kernels)
+    list(APPEND _list "$<TARGET_FILE:ninfer_kernels>")
+  endif()
   if(WIN32 AND DEFINED FFMPEG_VCPKG_TREE)
     foreach(_ninfer_dll_glob
       "avutil-*.dll" "avcodec-*.dll" "avformat-*.dll" "swscale-*.dll"
@@ -86,7 +134,7 @@ endfunction()
 # exes share a single per-config runtime directory, so one copy serves every one of
 # them (anchored on any always-built test target for the directory).
 function(ninfer_stage_test_runtime_dlls anchor_target)
-  if(NOT WIN32 OR NOT DEFINED FFMPEG_VCPKG_TREE)
+  if(NOT WIN32)
     return()
   endif()
   ninfer_runtime_dll_list(_ninfer_test_rt_dlls)

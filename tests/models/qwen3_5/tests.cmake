@@ -51,6 +51,16 @@ ninfer_add_test(ninfer_gemma4_output_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gemma_output.cpp"
   LIBRARIES ninfer_engine ninfer_core ninfer::json)
 
+ninfer_add_test(ninfer_flint_frontend_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_flint_frontend.cpp"
+  NEEDS_SOURCE_DIR
+  LIBRARIES ninfer_engine ninfer_core ninfer::json)
+
+ninfer_add_test(ninfer_deepseek_frontend_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_deepseek_frontend.cpp"
+  NEEDS_SOURCE_DIR
+  LIBRARIES ninfer_engine ninfer_core ninfer::json)
+
 ninfer_add_test(ninfer_qwen3_5_chat_template_prefix_stability_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_chat_template_prefix_stability.cpp"
   NEEDS_SOURCE_DIR
@@ -134,6 +144,11 @@ ninfer_add_test(ninfer_qwen3_5_vision_cpu_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_vision_cpu_real.cpp"
   LIBRARIES ninfer_engine)
 set_tests_properties(ninfer_qwen3_5_vision_cpu_real_test PROPERTIES SKIP_RETURN_CODE 77)
+
+ninfer_add_test(ninfer_qwen3_5_vision_overlay_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_vision_overlay_real.cpp"
+  LIBRARIES ninfer_engine)
+set_tests_properties(ninfer_qwen3_5_vision_overlay_real_test PROPERTIES SKIP_RETURN_CODE 77)
 
 ninfer_add_test(ninfer_qwen3_5_vision_workspace_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_vision_workspace.cpp"

@@ -44,8 +44,8 @@ routes to them (`--expert-residency disk`). Its n-gram table is stored in the mo
 in a separate table artifact the model names by digest (`--ngram-table`); it stays in that file,
 read a row at a time, unless `--ngram-residency ram` loads it. A model with PLE requires its table
 unless `--no-ngram-table` overrides that; a qualification layer slice without PLE needs no table.
-Native Qwen MoE and Gemma MoE also support host/disk expert placements, with all expert arithmetic
-on the GPU and whole-layer device banks beside the optional persistent cache.
+Native Qwen MoE, Gemma MoE and Flint also support host/disk expert placements, with all expert
+arithmetic on the GPU and whole-layer device banks beside the optional persistent cache.
 Gemma 4 26B-A4B (`Gemma4ForCausalLM`, the text component of `Gemma4ForConditionalGeneration`;
 `src/models/gemma4`, `runtime/engine/gemma4_core`) is a third explicit family converted from
 Google's QAT GGUF (or a mixed-format GGUF of the same model) with its ggml blocks kept as stored.
@@ -56,7 +56,30 @@ short) with an F16 KV cache or any
 `mtp` component, `--spec mtp`),
 encodes images and video with the release's vision tower (the artifact's `vision` component, from
 its llama.cpp mmproj; resident, streamed from pinned memory, or FP32 on CPU threads), and has no
-pipeline stages.
+pipeline stages; several GPUs divide its routed experts (`--tensor-parallel`).
+Flint (`FlintForCausalLM`; `src/models/flint`, `runtime/engine/flint_core`) is a fourth explicit
+family converted from a llama.cpp GGUF of Recursive's release (Unsloth's UD-Q4_K_XL) with its ggml
+blocks kept as stored. It shares the Qwen3.5 frontend in a Flint dialect (its pre-tokenizer, the
+role-marker chat template, reasoning the model opens itself, GLM-4.7 tool calls), runs one to eight
+sequences in prompt chunks of 2048 tokens with an F16 KV cache, drafts by context lookup only
+(`--lookup-ngram`; Recursive publishes no draft model), and has no vision, rotation scaling or
+pipeline stages; several GPUs divide its routed experts (`--tensor-parallel`).
+DeepSeek-V4.1-Flash (`DeepseekV41ForCausalLM`; `src/models/deepseek_v41`,
+`runtime/engine/deepseek_v41_core`) is a fifth explicit family converted from ISTA-DASLab's
+GSQ-RCO GGUF (IQ1_M) and its Engram table GGUF with the ggml blocks kept as stored. It shares the
+Qwen3.5 frontend in a DeepSeek dialect (the converter's transcription of the release's encoder as
+its chat template, DSML tool calls, reasoning opened by the prompt), runs one to eight sequences in
+prompt chunks of 2048 tokens with BF16 caches, keeps the release's FP8/FP4 attention roundings,
+drafts with the release's DSpark drafter (the `dspark` component, from beamster's STQ pack or
+Unsloth's GGUF; `--spec dspark`) or by context lookup, and keeps its routed experts in pinned host
+memory or in the artifact's files (read into bounded buffers, never mapped), CPU threads computing a
+share of a decode call's misses from the stored IQ1/IQ2 blocks while the GPU copies the rest. Its
+Engram table is embedded or a separate table artifact (`--ngram-table`), read a row at a time or
+held in RAM. It encodes images with the release's vision tower (the artifact's `vision` component,
+from the release's mmproj and its routing bias of image positions; resident or streamed from pinned
+memory).
+No video, rotation scaling or pipeline stages; several GPUs divide its host or disk experts
+(`--tensor-parallel`, each device its own banks and copies).
 Flash-Next's dense and attention arithmetic runs on the GPU. Of a decode or verification call's
 routed experts that the device cache lacks, CPU threads may compute a share from the host copy
 while the GPU copies and runs the rest (hybrid execution, `--expert-dma-share`), including a share
@@ -72,8 +95,10 @@ This line builds for **`sm_86`** (the RTX 30 series; that build also runs the RT
 (Turing: the TITAN RTX and RTX 20 series, Turing forms of the sm_80 instructions and Turing shapes
 of the kernels past its 64 KiB of shared memory, `docs/maintainer/build-system.md`), with `sm_80`
 (A100 class: device profiles calibrated, not benchmarked) and `sm_70` (Tesla V100, CUDA 12.x only, its own small-T,
-attention and prompt routes over emulated Ampere warp primitives, built from source); the
-published Docker image carries the `75`, `86` and `120a` builds. It was tuned on the **NVIDIA
+attention and prompt routes over emulated Ampere warp primitives). The Docker pipeline packages
+the native Debian 13 archives as `cuda12.9` (`70;75;80;86;89`) and `cuda13.4`
+(`75;80;86;89;120a`), with all targets in each shared backend. Portable native packages also combine both CUDA backends
+behind Toolkit-independent launchers, selecting one backend per process. It was tuned on the **NVIDIA
 GeForce RTX 3090** (24 GB) first, and each card's kernel routes now come from its measured device
 profile, built in for every card the Profile column of `docs/gpus.md` marks, from the Tesla V100
 to Blackwell. Upstream (`Neroued/ninfer`) targets `sm_120a` on RTX
@@ -82,14 +107,21 @@ route tables and published measurements are not authoritative here -- every rout
 inherited and re-measured on sm_86 turned out to be wrong by 12-41%. Treat an upstream tuning
 constant as a hypothesis until measured on the card in question. Windows builds and their
 toolchain constraints are in `docs/build-windows.md`; this repository has no Windows test host and
-CI does not build Windows.
+the Native release workflow builds native multi-architecture executables but does not run GPU inference.
 
 Generation uses one resident model on one GPU, or split into pipeline stages over up to eight
 (`--devices`; each stage owns whole layers with their KV and state, and the head,
 round state and sampling stay on the first device; design in
 `docs/maintainer/pipeline-stages.md`). It runs startup-fixed concurrency of one to eight
-requests, bounded FIFO ingress, no active-request preemption, and one compact decode batch per
-round. Tensor parallelism is not built.
+requests, bounded FIFO ingress (whose one-token reads trade places by remaining work), no
+active-request preemption, and one compact decode batch per
+round. Tensor parallelism (`--tensor-parallel`) divides the GDN heads, the attention's KV heads
+with their cache and the dense FFN rows or routed experts of a Qwen3.5-core model over the devices
+in shares sized to each card (`--tensor-split`, or measured bandwidth and free memory), with the
+head, the shared expert and MTP on the first; Qwen3.8-Flash-Next divides its GDN key heads,
+sparse-attention KV heads and routed experts the same way, every device keeping the
+hyper-connection stack; the other MoE families divide only their routed experts (expert
+parallelism, an exact fixed-point sum of the devices' parts).
 Generation and offline CausalScoring use the same public `.ninfer` Engine route. Delivered
 capabilities and commands are documented in `README.md`, the product guides, and executable
 `--help`. New mathematical architectures, execution platforms, large-scale/preemptive continuous
@@ -221,7 +253,7 @@ Read the authority relevant to the current decision; this is not a mandatory rea
 | Artifact, layout, codec, conversion, or model mathematics | model/artifact references and conversion guide linked from `docs/README.md` |
 | Op contracts, implementation ownership, numerical/performance qualification | `docs/maintainer/op-development.md` |
 | Test/benchmark commands and published performance | `tests/README.md`, `bench/README.md`, `docs/performance.md` |
-| In-tree C++ interface | `include/ninfer/engine.h`, `include/ninfer/types.h` |
+| In-tree C++ interface | `include/ninfer/engine.h`; types in the headers `include/ninfer/types.h` lists |
 
 [Documentation map](docs/README.md) routes to narrower authorities when needed.
 
