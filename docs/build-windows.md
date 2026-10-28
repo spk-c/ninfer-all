@@ -11,10 +11,22 @@ this guide is for a checkout.
 build and of an `86` build with Visual Studio 2022 (MSVC 14.44) and CUDA 12.8, the test suite on a
 TITAN RTX (TCC, and WDDM for the virtual-memory tests) and an RTX 3060 (WDDM), run by a contributor.
 This repository has no Windows test host. CI compiles the host code of every translation unit with
-MSVC 14.44 for `70` (CUDA 12.9), `75`, `80`, `86`, `89` and `120a` (CUDA 13.4) on each change
-to the build inputs (`scripts/check-host-compile.py`), but builds no device code and runs nothing
-on Windows; the Windows-only build option below compiles against Windows headers and has not been
-run.
+MSVC 14.44 for `70;75;80;86;89` (CUDA 12.9) and `75;80;86;89;120a` (CUDA 13.4) on each change
+to the build inputs (`scripts/check-host-compile.py`), but that host check builds no device code.
+The separate `Native release` workflow compiles
+and links the release products for two CUDA versions, checks their device images and tests `--help`
+without the Toolkit on `PATH`. It has no GPU and does not qualify inference or performance.
+The October 22 [dual-CUDA release run](https://github.com/iamwavecut/ninfer-all/actions/runs/39741764110)
+completed native linking, device-image checks, startup checks, archive verification and upload
+for both variants.
+The Windows-only DirectStorage option below has not been run.
+
+MSVC builds delay-load `nvcuda.dll`, so `--help` can run without an NVIDIA driver.
+GPU execution still requires a compatible driver and device.
+
+Users run `120a` builds from `scripts\build-native.bat` with Visual Studio 2026 Build Tools and
+CUDA 13.4 on an RTX 5070 Ti, and `89` builds with CUDA 13.4 on RTX 4090s
+([field reports](performance/field-reports.md)).
 
 ## Requirements
 
@@ -102,5 +114,63 @@ on a 24 GB card that serves a desktop, an explicit capacity is easier to predict
 
 ## Release archive
 
-`scripts\package-release.ps1` (or `.\scripts\build.ps1 -Package`) builds the Windows ZIP for the
-version in `VERSION`; [cutting a release](maintainer/release-process.md) describes the flow.
+The `Native release` workflow builds two single-CUDA x64 packages with VS 2022 and Ninja, then assembles a universal package:
+
+| Toolkit | Device images available to each executable |
+|---|---|
+| CUDA 12.9.2 | `70;75;80;86;89` (Volta through Ada) |
+| CUDA 13.4.3 | `75;80;86;89;120a` (Turing through consumer Blackwell) |
+
+Each Toolkit compiles its release objects in eight jobs. Every CUDA object retains the complete
+architecture set above. Jobs checkpoint separate HF cache families; a final job restores them,
+links the executables and verifies the package. At most eight object jobs run together across
+both Toolkits. Each runner uses two compiler processes with two nvcc optimization threads each,
+to limit the memory pressure observed on the four-CPU Windows runners. This does not establish
+a bound on compilation time for the largest individual source files.
+
+Windows release builds set `NINFER_CUDA_PRUNE_PTX=ON`. NVIDIA's `nvprune` removes PTX from
+the CUDA static archives before linking, retaining machine code for every listed GPU architecture.
+This reduces the image size without recompiling cached objects. These packages do not provide
+PTX fallback for GPUs that cannot run any of their machine-code images. Local builds retain PTX
+by default; enabling this option requires the Toolkit's `nvprune` component.
+
+The workflow also sets `NINFER_WINDOWS_KERNEL_DLL=ON`: the GGML kernels and the INT8-family
+small-T attention units reside in `ninfer_kernels.dll` inside the selected backend directory.
+The DLL carries the same architecture set. Its GGML objects retain their PTX; the attention units
+come from a pruned archive like the other CUDA archives. The split keeps every PE image within
+what Windows loads: the loader refuses an image whose `SizeOfImage` exceeds `0x77000000`
+(1904 MiB) with error 193, although the linker accepts up to 2 GiB. In the CUDA 12.9 runtime DLL
+of revision `7a89828a3`, the attention units held 1068 of the 1841 MiB of device code. The DLL
+uses the existing function-only GGML bridge, exports only the attention units' launch
+instantiations, and is staged for apps, the product benchmark and tests. Local builds default to
+the static libraries. The packager checks device images in the kernel DLL and the shared runtime
+DLL.
+
+Every push to `master` starts the current build and cancels the superseded run.
+Feature branches build only through a manual run, which builds the packages
+without publication by default. Select `publish` on `master` to publish. Both Windows and both Linux jobs must
+pass before publication. The workflow creates an source-identified `YYYY-MM-DD.N` release,
+then marks it **latest** after checking every uploaded asset. It leaves an older latest release
+available if compilation, packaging or upload fails. See [release process](maintainer/release-process.md).
+
+For a local build, `scripts\package-release.ps1` (or `.\scripts\build.ps1 -Package`) derives the
+Toolkit and device images from `CMakeCache.txt`. It requires `cuobjdump` in that Toolkit and `7z`
+on `PATH` and `NINFER_SHARED_RUNTIME=ON` in the build. It packages all six command EXEs, their runtime DLLs,
+licences and launchers into `.7z.001` volumes of at most 1900 MiB. Download every volume of one
+package into the same folder and extract the first with 7-Zip. Keep the backend subdirectories intact.
+
+`BUILD-INFO.json` records the version, source revision, source modifications, CUDA version and device
+images. Archive names use the platform, CUDA version, GPU architectures and 12-character source commit,
+for example `ninfer-windows-x64-cuda13.4-sm75-80-86-89-120a-0123456789ab.7z.001`.
+
+The previous static-EXE layout produced CUDA 13.4 executables of about 1.95 GB each, plus a 313 MB
+GGML DLL. Its package was 6.73 GB unpacked and 6.37 GB archived. The shared-runtime layout removes
+this duplication between commands. Its actual linked sizes and GPU behavior still require native
+validation. The packager reads each device module's `SizeOfImage` and rejects one above
+`0x77000000`. Archive splitting only addresses GitHub's asset limit.
+
+The universal name is `ninfer-windows-x64-cuda12.9-13.4-<commit12>`. Each small EXE chooses one backend
+from `backends/cuda12/` and `backends/cuda13/`. Use `--cuda-backend auto|12|13` to override selection.
+`--help` and `--version` need no driver. See the [release process](maintainer/release-process.md)
+for selection, cache and verification details. A successful startup check does not establish GPU
+correctness or throughput.
