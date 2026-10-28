@@ -1,4 +1,5 @@
 #include "ninfer_bench_support.h"
+#include "product/hybrid_expert_options.h"
 #include "product/rope_yarn_options.h"
 #include "product/speculative_options.h"
 
@@ -315,7 +316,12 @@ std::string usage_text(std::string_view program) {
         << " (default: the Engine's automatic chunk)\n"
         << "  --expert-residency <device|host|disk>  routed MoE experts on the GPU (default), in "
            "pinned host memory, or in the artifact files\n"
+        << "  --embedding-residency <device|host>  token embedding on the GPU (default) or in "
+           "mapped pinned host memory\n"
         << "  --expert-cache-mib <N|auto> persistent device expert cache (default: auto)\n"
+        << "  --expert-dma-share <F|auto> host or disk experts: the GPU's share of a decode call's\n"
+           "                              cache misses, the CPU computing the rest (default: auto)\n"
+        << "  --expert-cpu-threads <N>    host or disk experts: CPU workers (default: automatic)\n"
         << "  --kv-dtype <bf16|int8|fp8|rk8v4|rk4v4|rk4v4-e8|rk2v4-e8|nvfp4|k8v4>  KV cache storage "
            "(default: bf16)\n"
         << "  --fast-prefill-kernel       fast INT8-KV prompt kernel, wave-aligned chunks\n"
@@ -397,6 +403,15 @@ BenchOptions parse_args(int argc, char** argv) {
             } else {
                 throw std::invalid_argument("--expert-residency must be device, host or disk");
             }
+        } else if (arg == "--embedding-residency") {
+            const std::string residency = value("--embedding-residency");
+            if (residency == "device") {
+                options.embedding_residency = EmbeddingResidency::Device;
+            } else if (residency == "host") {
+                options.embedding_residency = EmbeddingResidency::Host;
+            } else {
+                throw std::invalid_argument("--embedding-residency must be device or host");
+            }
         } else if (arg == "--expert-cache-mib") {
             const std::string mib = value("--expert-cache-mib");
             if (mib == "auto") {
@@ -405,6 +420,9 @@ BenchOptions parse_args(int argc, char** argv) {
                 options.expert_cache_bytes = std::uint64_t(parse_u32(mib, "expert-cache-mib", true))
                                              << 20;
             }
+        } else if ((arg == "--expert-dma-share" || arg == "--expert-cpu-threads") &&
+                   product::parse_hybrid_expert_option(arg, options.hybrid_experts,
+                                                       [&] { return value(argv[i]); })) {
         } else if (arg == "--fast-prefill-kernel") {
             options.fast_prefill_kernel = true;
         } else if (arg == "--spec") {
@@ -673,6 +691,7 @@ std::string format_table(const BenchEnvironment& env, const std::vector<TestResu
         << " fast_prefill_kernel=" << (env.fast_prefill_kernel ? "on" : "off")
         << " kv_cache=" << kv_cache_name(env.kv_cache)
         << " experts=" << expert_residency_name(env.expert_residency)
+        << " embedding=" << (env.embedding_residency == EmbeddingResidency::Host ? "host" : "device")
         << " spec=" << product::speculative_backend_name(env.speculative.backend)
         << " draft_tokens=" << env.speculative.draft_tokens
         << " ngram_draft_tokens=" << env.speculative.ngram_draft_tokens
@@ -798,6 +817,8 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
         << "    \"fast_prefill_kernel\": " << (env.fast_prefill_kernel ? "true" : "false") << ",\n"
         << "    \"kv_cache\": \"" << kv_cache_name(env.kv_cache) << "\",\n"
         << "    \"expert_residency\": \"" << expert_residency_name(env.expert_residency) << "\",\n"
+        << "    \"embedding_residency\": \""
+        << (env.embedding_residency == EmbeddingResidency::Host ? "host" : "device") << "\",\n"
         << "    \"expert_cache_bytes\": " << env.memory.expert_cache_bytes << ",\n"
         << "    \"expert_routes\": " << env.experts.routes << ",\n"
         << "    \"expert_hits\": " << env.experts.hits << ",\n"
