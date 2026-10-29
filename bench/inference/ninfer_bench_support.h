@@ -69,6 +69,7 @@ struct BenchOptions {
     float rope_yarn_factor      = 1.0F;
     bool fast_prefill_kernel    = false;
     std::uint32_t prefill_chunk = 0; // 0: the Engine's automatic chunk
+    bool gdn_state_fp16         = false;
     KvCacheStorage kv_cache     = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
     ExpertResidency expert_residency = ExpertResidency::Device;
@@ -119,6 +120,7 @@ struct BenchEnvironment {
     std::uint32_t max_context   = 0;
     float rope_yarn_factor      = 1.0F;
     std::uint32_t prefill_chunk = 0;
+    bool gdn_state_fp16         = false;
     bool fast_prefill_kernel    = false;
     KvCacheStorage kv_cache     = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;

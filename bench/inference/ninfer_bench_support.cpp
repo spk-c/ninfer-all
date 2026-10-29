@@ -314,6 +314,7 @@ std::string usage_text(std::string_view program) {
            "(default: 1, native RoPE)\n"
         << "  --prefill-chunk <tokens>    multiple of " << kPrefillChunkAlignment
         << " (default: the Engine's automatic chunk)\n"
+        << "  --gdn-state-fp16            keep GDN recurrent state in FP16 (default: FP32)\n"
         << "  --expert-residency <device|host|disk>  routed MoE experts on the GPU (default), in "
            "pinned host memory, or in the artifact files\n"
         << "  --embedding-residency <device|host>  token embedding on the GPU (default) or in "
@@ -390,6 +391,8 @@ BenchOptions parse_args(int argc, char** argv) {
             options.rope_yarn_factor = product::parse_rope_yarn_factor(value("--rope-yarn-factor"));
         } else if (arg == "--prefill-chunk") {
             options.prefill_chunk = parse_u32(value("--prefill-chunk"), "prefill-chunk");
+        } else if (arg == "--gdn-state-fp16") {
+            options.gdn_state_fp16 = true;
         } else if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_cache(value("--kv-dtype"));
         } else if (arg == "--expert-residency") {
@@ -688,6 +691,7 @@ std::string format_table(const BenchEnvironment& env, const std::vector<TestResu
         << "  corpus:     " << env.corpus_path << " (" << env.corpus_tokens << " tokens)\n"
         << "  config:     max_context=" << env.max_context
         << " rope_yarn_factor=" << env.rope_yarn_factor << " prefill_chunk=" << env.prefill_chunk
+        << " gdn_state=" << (env.gdn_state_fp16 ? "fp16" : "fp32")
         << " fast_prefill_kernel=" << (env.fast_prefill_kernel ? "on" : "off")
         << " kv_cache=" << kv_cache_name(env.kv_cache)
         << " experts=" << expert_residency_name(env.expert_residency)
@@ -814,6 +818,7 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
         << "    \"max_context\": " << env.max_context << ",\n"
         << "    \"rope_yarn_factor\": " << env.rope_yarn_factor << ",\n"
         << "    \"prefill_chunk\": " << env.prefill_chunk << ",\n"
+        << "    \"gdn_state_fp16\": " << (env.gdn_state_fp16 ? "true" : "false") << ",\n"
         << "    \"fast_prefill_kernel\": " << (env.fast_prefill_kernel ? "true" : "false") << ",\n"
         << "    \"kv_cache\": \"" << kv_cache_name(env.kv_cache) << "\",\n"
         << "    \"expert_residency\": \"" << expert_residency_name(env.expert_residency) << "\",\n"
@@ -907,7 +912,7 @@ std::string csv_field(std::string_view value) {
 std::string format_csv(const BenchEnvironment& env, const std::vector<TestResult>& results) {
     std::ostringstream out;
     out << "label,kind,n_prompt,n_gen,architecture,prefill_signature,model_name,artifact_path,max_"
-           "context,rope_yarn_factor,prefill_chunk,"
+           "context,rope_yarn_factor,prefill_chunk,gdn_state_fp16,"
            "speculative_"
            "backend,draft_tokens,ngram_draft_tokens,ngram_min_match,"
            "proposal_head,decode_path,kv_cache,kv_payload_bytes,load_host_to_device_bytes,"
@@ -936,7 +941,7 @@ std::string format_csv(const BenchEnvironment& env, const std::vector<TestResult
             << result.test.n_prompt << ',' << result.test.n_gen << ',' << env.load.architecture
             << ',' << env.load.prefill_signature << ',' << csv_field(env.load.model_name) << ','
             << csv_field(env.artifact_path) << ',' << env.max_context << ','
-            << env.rope_yarn_factor << ',' << env.prefill_chunk
+            << env.rope_yarn_factor << ',' << env.prefill_chunk << ',' << env.gdn_state_fp16
             << ',' << product::speculative_backend_name(env.speculative.backend) << ','
             << env.speculative.draft_tokens << ',' << env.speculative.ngram_draft_tokens << ','
             << env.speculative.ngram_min_match << ','

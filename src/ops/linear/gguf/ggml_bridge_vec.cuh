@@ -663,14 +663,31 @@ template <>
 struct Decoder<GGML_TYPE_IQ3_S> {
     static constexpr int kBlockElems = 256, kBlockBytes = 110, kTableWords = 512;
     __device__ static const std::uint32_t* table() { return iq3s_grid; }
+    template <bool SharedMetadata = false>
     __device__ __forceinline__ static void decode(const std::uint8_t* b, int u,
                                                   const std::uint32_t* grid, Slice& s) {
         const std::uint32_t q0 = u32_a2(b + 2 + 8 * u);
         const std::uint32_t q1 = u32_a2(b + 6 + 8 * u);
         const std::uint32_t qh = b[66 + u];
         const std::uint32_t sg = u32_a2(b + 74 + 4 * u);
-        const int sc           = (b[106 + u / 2] >> (4 * (u & 1))) & 0xF;
-        s.f[0]                 = half_at(b) * float(1 + 2 * sc);
+        if constexpr (SharedMetadata) {
+            // A complete eight-lane group owns one 256-value block. Read its half
+            // scale and four packed scale bytes once; keep all decoding/products
+            // and their rounding identical. This is not a DRAM-reload reduction.
+            unsigned d = 0, scales = 0;
+            if (u == 0) {
+                d = *reinterpret_cast<const std::uint16_t*>(b);
+                scales = u32_a2(b + 106); // 2-byte aligned, wholly within the 110-byte block
+            }
+            d = __shfl_sync(0xFFFFFFFFu, d, 0, 8);
+            scales = __shfl_sync(0xFFFFFFFFu, scales, 0, 8);
+            const int sc = (scales >> (4 * u)) & 0xF;
+            s.f[0] = __half2float(__ushort_as_half(static_cast<unsigned short>(d))) *
+                     float(1 + 2 * sc);
+        } else {
+            const int sc = (b[106 + u / 2] >> (4 * (u & 1))) & 0xF;
+            s.f[0] = half_at(b) * float(1 + 2 * sc);
+        }
 #pragma unroll
         for (int e = 0; e < 8; ++e) {
             const std::uint32_t idx = (((e < 4 ? q0 : q1) >> (8 * (e & 3))) & 0xFF) | ((qh << (8 - e)) & 0x100);
@@ -798,7 +815,15 @@ __launch_bounds__(kVecWarps * 32) __global__ void kernel(VecArgs p) {
             for (int r = 0; r < kRows; ++r) {
                 Slice sl;
                 const auto* block = rowp[r] + std::int64_t(32 / kPerBlock) * it * D::kBlockBytes;
-                decode_words<D, Cooperative>(block, sub, table, sl);
+#if defined(NINFER_ADA_GGUF_IQ3S_WARP_META)
+                if constexpr (type == GGML_TYPE_IQ3_S && KS == 5120 && !Fused &&
+                              (T == 1 || T == 6)) {
+                    D::template decode<true>(block, sub, table, sl);
+                } else
+#endif
+                {
+                    decode_words<D, Cooperative>(block, sub, table, sl);
+                }
 #pragma unroll
                 for (int j = 0; j < T; ++j) { acc[r][j] += D::dot(sl, a[j], d[j], sum[j]); }
             }

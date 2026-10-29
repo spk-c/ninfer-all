@@ -79,6 +79,7 @@ int test_cli_contract() {
         "4096",
         "--prefill-chunk",
         "128",
+        "--gdn-state-fp16",
         "--kv-dtype",
         "int8",
         "--spec",
@@ -104,6 +105,9 @@ int test_cli_contract() {
     failures += expect(parsed.repetitions == 3 && parsed.warmup == 2, "repetition settings");
     failures += expect(parsed.max_context == std::optional<std::uint32_t>(4096), "max context");
     failures += expect(parsed.prefill_chunk == 128, "prefill chunk");
+    failures += expect(parsed.gdn_state_fp16, "FP16 GDN state flag");
+    failures += expect(!parse_for_test({"ninfer_bench", "--weights", "model.ninfer"}).gdn_state_fp16,
+                       "default GDN state remains FP32");
     failures += expect(parsed.kv_cache == ninfer::KvCacheStorage::Int8Group64, "INT8 KV");
     failures += expect(parsed.speculative.draft_tokens == 5, "MTP window");
     failures += expect(parsed.speculative.proposal_head == ninfer::ProposalHead::Optimized,
@@ -417,6 +421,7 @@ qb::BenchEnvironment sample_environment() {
     env.max_context                       = 4096;
     env.rope_yarn_factor                  = 2.5F;
     env.prefill_chunk                     = 1024;
+    env.gdn_state_fp16                    = true;
     env.kv_cache                          = ninfer::KvCacheStorage::Int8Group64;
     env.speculative.backend               = ninfer::SpeculativeBackend::Mtp;
     env.speculative.draft_tokens          = 5;
@@ -451,6 +456,8 @@ int test_report_contract() {
     failures += expect(report.at("config").at("rope_yarn_factor") == 2.5,
                        "report preserves runtime YaRN factor");
     failures += expect(report.at("schema_version") == 19, "report schema v19");
+    failures += expect(report.at("config").at("gdn_state_fp16") == true,
+                       "report preserves actual GDN state format");
     failures += expect(report.at("tests").at(0).at("reps").at(0).at("timings")
                            .at("first_token_seconds") == results[0].reps[0].timings.first_token_seconds,
                        "report preserves Engine TTFT");

@@ -65,6 +65,7 @@ ninfer_bench --weights <artifact.ninfer>
           [-pg, --prompt-gen <P,G;P,G...>]
           [-r, --repetitions <n>] [--warmup <n>]
           [--max-ctx <tokens>] [--prefill-chunk <tokens>]
+          [--gdn-state-fp16]
           [--kv-dtype <bf16|int8|fp8|nvfp4|k8v4>] [--fast-prefill-kernel]
           [--expert-residency <device|host|disk>] [--expert-cache-mib <N|auto>]
           [--embedding-residency <device|host>]
@@ -75,6 +76,8 @@ ninfer_bench --weights <artifact.ninfer>
 ```
 
 With no `-p`, `-n`, or `-pg`, the matrix is `pp512` and `tg128`.
+`--gdn-state-fp16` selects the Engine's existing FP16 recurrent state; the default
+is FP32. The table, JSON configuration and CSV report the selected state format.
 
 Example:
 

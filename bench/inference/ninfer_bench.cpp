@@ -167,6 +167,7 @@ int main(int argc, char** argv) {
         engine_options.rope_yarn_factor = options.rope_yarn_factor;
         engine_options.kv_capacity   = ninfer::KvCapacityPolicy::explicit_capacity(max_context);
         engine_options.prefill_chunk = options.prefill_chunk;
+        engine_options.gdn_state_fp16 = options.gdn_state_fp16;
         engine_options.fast_prefill_kernel        = options.fast_prefill_kernel;
         engine_options.kv_cache      = options.kv_cache;
         engine_options.context_cache.enabled = false;
@@ -208,6 +209,7 @@ int main(int argc, char** argv) {
         env.load   = engine.load_summary();
         env.memory = engine.memory_summary();
         env.prefill_chunk = engine.options().prefill_chunk;
+        env.gdn_state_fp16 = engine.options().gdn_state_fp16;
 
         prime_decode_graph(engine, env, corpus);
 
