@@ -6,8 +6,10 @@
 # nvidia-smi lists it elsewhere, so the indices for --devices must be read from a CUDA-level
 # enumeration rather than assumed.
 #
-# device.cu, its launch helpers and peer preflight are compiled in directly rather than linked
-# from the core. This keeps the probe small instead of pulling in the whole core -- which
+# device.cu, its launch helpers (device_launch.cpp) and the peer preflight device.cu calls
+# (peer_preflight.cpp) are compiled in directly rather than linked from the core. They only include
+# core/device.h, core/peer_preflight.h and standard headers, so this costs three translation units
+# and keeps the probe around 1 MB instead of the ~500 MB a core link would produce -- which
 # matters because this binary gets uploaded to rented hardware to be run there.
 add_executable(ninfer-multi-gpu-probe
   multi_gpu_probe.cu
@@ -26,6 +28,22 @@ set_target_properties(ninfer-multi-gpu-probe PROPERTIES
 # portability check. Standalone like the probe above, so it can be uploaded to rented hardware.
 add_executable(ninfer-tp-probe tp_probe.cu)
 set_target_properties(ninfer-tp-probe PROPERTIES
+  CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools")
+
+# Times the engine's own tensor-parallel exchange (core/tensor_parallel.cu) over the ranks of a
+# device list: whole reduces against the reduce-scatter and all-gather, through peer reads and
+# host memory, beside a copy-engine reference. The exchange only includes core/device.h, so it is
+# compiled in with the device sources, as for ninfer-multi-gpu-probe, instead of linking the core.
+add_executable(ninfer-tp-exchange-bench
+  tp_exchange_bench.cu
+  ${CMAKE_SOURCE_DIR}/src/core/tensor_parallel.cu
+  ${CMAKE_SOURCE_DIR}/src/core/device.cu
+  ${CMAKE_SOURCE_DIR}/src/core/device_launch.cpp
+  ${CMAKE_SOURCE_DIR}/src/core/peer_preflight.cpp)
+target_include_directories(ninfer-tp-exchange-bench PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(ninfer-tp-exchange-bench PRIVATE CUDA::toolkit)
+set_target_properties(ninfer-tp-exchange-bench PROPERTIES
   CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools")
 
