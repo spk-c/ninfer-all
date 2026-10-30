@@ -40,12 +40,15 @@ def write_backend_comparison(summary: dict, out: Path) -> dict:
 
 
 def run(exe: Path, model: Path, prompt_file: Path, out: Path, name: str,
-        mode: str, arm: str, gdn_state_fp16: bool = False) -> dict:
+        mode: str, arm: str, gdn_state_fp16: bool = False,
+        prefill_chunk: int | None = None) -> dict:
     args = [str(exe), str(model), "--messages", str(prompt_file),
             "--max-new", "64", "--max-context", "8192", "--kv-dtype", "rk4v4",
             "--greedy", "--raw-output", "--print-token-ids", "--spec", mode]
     if gdn_state_fp16:
         args += ["--gdn-state-fp16"]
+    if prefill_chunk is not None:
+        args += ["--prefill-chunk", str(prefill_chunk)]
     if mode == "dflash2":
         args += ["--draft-tokens", "5", "--ngram-draft-tokens", "0"]
     process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -84,6 +87,10 @@ def main() -> None:
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument("--gdn-state-fp16", action="store_true",
                         help="compare with the Engine's FP16 recurrent state in both arms")
+    parser.add_argument("--base-prefill-chunk", type=int,
+                        help="explicit prefill chunk for the baseline arm")
+    parser.add_argument("--candidate-prefill-chunk", type=int,
+                        help="explicit prefill chunk for the candidate arm")
     args = parser.parse_args()
     for path in (args.base, args.candidate, args.weights):
         if not path.is_absolute() or not path.is_file():
@@ -99,7 +106,9 @@ def main() -> None:
             for arm in arms:
                 exe = args.base if arm == "base" else args.candidate
                 results[arm] = run(exe, args.weights, prompt_file, args.out, name, mode, arm,
-                                   args.gdn_state_fp16)
+                                   args.gdn_state_fp16,
+                                   args.base_prefill_chunk if arm == "base"
+                                   else args.candidate_prefill_chunk)
             equal = (results["base"]["generated_ids"] == results["candidate"]["generated_ids"]
                      and results["base"]["text"] == results["candidate"]["text"]
                      and results["base"]["prompt_tokens"] == results["candidate"]["prompt_tokens"])

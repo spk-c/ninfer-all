@@ -172,11 +172,6 @@ if(NINFER_ADA_GGUF_IQ3S_T6_LOOP)
     message(FATAL_ERROR "NINFER_ADA_GGUF_IQ3S_T6_LOOP requires a single sm_89 build")
   endif()
 endif()
-option(NINFER_ADA_GGUF_IQ3S_WARP_META
-       "Share IQ3_S block metadata across eight lanes at T=1/6 K=5120 on sm_89" OFF)
-if(NINFER_ADA_GGUF_IQ3S_WARP_META AND NOT CMAKE_CUDA_ARCHITECTURES STREQUAL "89")
-  message(FATAL_ERROR "NINFER_ADA_GGUF_IQ3S_WARP_META requires a single sm_89 build")
-endif()
 option(NINFER_SFU_SOFTPLUS
        "Evaluate the GDN gate's softplus on the SFU instead of expf and log1pf" OFF)
 if(NINFER_SFU_SOFTPLUS)
