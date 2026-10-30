@@ -47,15 +47,18 @@ direction. Refused directions stage through pinned host memory and are reported 
 
 ## How it works
 
-- **`StagePlan`** (`core/stage_plan.h`) says which contiguous layers each stage owns. `--stage-layers
-  30,34` sets the counts. Without it `default_stage_layers` (`models/qwen3_5/load.cpp`) sizes each
-  layer from the artifact and calls `solve_stage_plan`, an exact memory-balancing solver (maximum
-  page groups every stage can hold, then least-full stage), verified against a brute-force
-  partition oracle. It works from the bytes free on each device, the stored KV page-group and
-  per-slot GDN state bytes of each layer (from the engine's KV storage format and slot count), and
-  rough constants for what a stage needs beyond weights (context, workspace, graphs; more on rank
-  0 for the head), so it is a good default rather than exact; if it finds nothing fits
-  it deals the layers evenly and lets the Program's planning report the device that runs out.
+- **`StagePlan`** (`core/stage_plan.h`) says which contiguous layers each stage owns.
+  `--stage-layers 30,34` sets the counts. Without it `default_stage_layers`
+  (`models/qwen3_5/load.cpp`) sizes each layer from the artifact and calls `solve_stage_plan`, an
+  exact memory-balancing solver (maximum page groups every stage can hold, then least-full stage),
+  verified against a brute-force partition oracle. It works from the bytes free on each device, the
+  stored KV page-group and per-slot GDN state bytes of each layer (from the engine's KV storage
+  format and slot count), and rough constants for what a stage needs beyond weights (context,
+  workspace, graphs; more on rank 0 for the head). The head stage also holds the embedding, the
+  head, and as selected MTP's layer with its KV per page group, the proposal head, a DFlash drafter
+  and a resident Vision tower; automatic KV capacity keeps its headroom free on every device. It is
+  a good default rather than exact; if it finds nothing fits it deals the layers evenly and lets the
+  Program's planning report the device that runs out.
 - **Placement.** `bind_text` places every layer's weights on its stage's device
   (`Bindings::place`, recorded for rank 0 as well so an object shared between a rank-0 layer and a
   later stage's layer is refused as a conflicting placement). The embedding, final norm and head stay
@@ -308,10 +311,13 @@ families](#expert-parallelism-of-the-other-moe-families)).
   measures each card's device-to-device copy bandwidth (`rank_copy_bandwidth`, 128 MiB; ranks on one
   card divide its figure) as its speed, works out how much of the divided weights, GDN state and KV
   cache for the configured context and concurrency each card can hold beside what every rank holds
-  and, on rank 0, the embedding and the head (`default_tensor_split`,
+  and, on rank 0, the embedding, the head and, as selected, MTP's layer with its KV, the proposal
+  head, a DFlash drafter and a resident Vision tower (`default_tensor_split`,
   `models/qwen3_5/load.cpp`), and fills the cards in proportion to speed, capping a card at its room
-  and passing the excess to the others (`fill_shares`). Decode reads every weight once per token, so
-  bandwidth sets each rank's time.
+  and passing the excess to the others (`fill_shares`). Automatic KV capacity also keeps its
+  headroom free on every card, and when the longest context fits nowhere it divides the cards by
+  room instead of speed, so the KV it shrinks to is the most that fits. Decode reads every weight
+  once per token, so bandwidth sets each rank's time.
 - **The pass** (`TextContext::run_tensor_parallel`). Rank 0 sends the residual and the control
   tensors to every rank over the stage links; each rank then keeps a replica of the residual. Each
   layer has two exchanges (`core/tensor_parallel.h`): after the mixer (attention: the ranks holding
@@ -343,16 +349,23 @@ families](#expert-parallelism-of-the-other-moe-families)).
   at 5,300 against 6,700 on two RTX 3090s.
 - **Numerics.** Against one device the order of the FP32 additions of a projection's output
   differs: the shares' partial sums are added, then rounded once, where one device rounds the full
-  sum. On `120a` FP8 and NVFP4 shares also keep BF16 activations (A16, under Coverage) where one
-  device quantizes them for its W8A8 and W4A4 routes. Logits are close, not identical, so greedy
-  text can diverge where two tokens tie closely.
+  sum. On `120a` NVFP4 and FP8 shares quantize their activations for W4A4 and W8A8 routes (under
+  Coverage). An NVFP4 share takes one device's 16-value groups and static input divisor and divides
+  on every tile, so its codes do not depend on the tile: they are one device's where one device runs
+  its TMA route (from 256 to 1,024 tokens, by shape), and below that, where one device's MMA route
+  multiplies by a reciprocal, a value at an exact tie can differ by one code. An FP8 share of an
+  output or down projection scales each token over its own columns, a finer scale than one device's
+  over the whole row. Logits are close, not identical, so greedy text can diverge where two tokens
+  tie closely.
 - **Coverage.** Every weight format of a dense Qwen3.5-core model: GGUF, BF16, row-split
   Q4/Q5/Q6/Q8 and T2, FP8 and NVFP4, Hadamard-rotated or not; any split the stored blocks allow on
   two to eight ranks, cards of different models where the build runs on each; MTP, the masked
   drafters (DFlash, DFlash2: rank 0's replica after each layer is the residual one device taps),
   grafted prefixes (each rank appends its KV heads) and Vision (on rank 0). A share's projections have no tuned shapes, so they take Linear's
   runtime-shape routes (the shape tables' kernel templates with the rows and K read from the
-  operands; FP8 and NVFP4 with A16 compute whatever the policy): the GDN input projection as parts,
+  operands; on `120a` NVFP4 shares that allow A4 run W4A4 from 9 tokens and FP8 shares that allow A8
+  run W8A8 from 17 tokens, A16 below, on the tile whose CTAs fill the fewest weighted waves of the
+  card's multiprocessors): the GDN input projection as parts,
   one Linear per piece into the q/k/v and z planes; gate and up as two FP32 products that SwiGLU
   rounds once; the output and down projections as FP32 partials. A rotated share turns its whole
   input, or its own 1024-column blocks of it, with its slice of the sign vector
@@ -492,6 +505,22 @@ repeats, not with one device's.
   four; it scores 721 tok/s against 642 on two cards, 592 against 578 on one card and 533 against
   300 on four. These runs used one 256 KiB threshold; the thresholds now in place change only
   exchanges of 7 to 15 columns, which they do not make.
+- **W4A4 and W8A8 shares on 2x RTX 5090** (2026-10-29, against master's A16 shares; Vast, CUDA
+  13.4, no peer access, so the host transport). Qwen3.8-27B NVFP4 (`--max-context 16384`; greedy
+  256-token answers to two short prompts and one after a 9,715-token prompt, two rounds): the long
+  prompt prefills at 4,215-4,647 tok/s against 2,758-2,837 (+49% to +69%; TTFT 2.09-2.30 s against
+  3.42-3.52 s), and at 4,260-4,559 against 3,037-3,072 with `--spec mtp --draft-tokens 3
+  --lm-head-draft` (+39% to +50%); one card prefills it at 11,307-11,353 tok/s. The short prompts'
+  TTFT is 44-78 ms against 63-95 ms. Decode runs no changed route (one to four tokens stay below
+  both thresholds): master's pair decoded at 54.0-60.6 tok/s in both rounds, this build's at
+  56.0-58.5 in one round and at 92.8-97.1 in the other, a spread whose cause is not known. With the
+  fenced stage release of the TMA pipelines ([Op development](op-development.md#tma-pipeline-stages))
+  three more rounds prefilled at 4,128-4,749 tok/s (4,246-4,708 with MTP), decoding at 53.7-57.0
+  or at 93.4-97.6 tok/s again. Perplexity
+  over 320 KB of WikiText (65,304 tokens, 4,096-token windows, stride 2,048, int8 KV; before NVFP4
+  shares divided on every tile and before the fence) is 6.0801 against one card's 6.0880 and 6.0666
+  with the shares on A16; over 40 KB, two ranks on one card (`--devices 0,0`) give the two cards'
+  6.18009 in three runs, where without the fence three runs gave 6.1586, 6.1827 and 6.1901.
 
 ### Attention by positions
 
