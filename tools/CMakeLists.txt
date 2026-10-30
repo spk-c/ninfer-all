@@ -9,8 +9,8 @@
 # device.cu, its launch helpers (device_launch.cpp) and the peer preflight device.cu calls
 # (peer_preflight.cpp) are compiled in directly rather than linked from the core. They only include
 # core/device.h, core/peer_preflight.h and standard headers, so this costs three translation units
-# and keeps the probe around 1 MB instead of the ~500 MB a core link would produce -- which
-# matters because this binary gets uploaded to rented hardware to be run there.
+# and keeps the probe around 1 MB instead of the ~500 MB a core link would produce -- which matters
+# because this binary gets uploaded to rented hardware to be run there.
 add_executable(ninfer-multi-gpu-probe
   multi_gpu_probe.cu
   ${CMAKE_SOURCE_DIR}/src/core/device.cu
