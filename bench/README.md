@@ -79,6 +79,13 @@ With no `-p`, `-n`, or `-pg`, the matrix is `pp512` and `tg128`.
 `--gdn-state-fp16` selects the Engine's existing FP16 recurrent state; the default
 is FP32. The table, JSON configuration and CSV report the selected state format.
 
+For exact greedy regression comparisons, `tools/bench/compare_gguf_iq3s_quality_4090.py`
+runs the public CLI in plain and DFlash2 modes. Pass `--gdn-state-fp16` for both
+arms and `--base-prefill-chunk N --candidate-prefill-chunk N` to fix their chunks
+explicitly; omitted chunks retain each executable's automatic selection. The
+controller records token/text mismatches and exits unsuccessfully, rather than
+treating different speculative acceptance as proof of numerical equivalence.
+
 Example:
 
 ```bash

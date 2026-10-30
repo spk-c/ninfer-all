@@ -517,7 +517,7 @@ int run_mapped_table(const TypeCase& c, std::uint32_t seed, std::int32_t vocabul
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) {
         std::cout << "SKIP: no usable CUDA device\n";
@@ -526,8 +526,11 @@ int main() {
     try {
         int failures      = 0;
         std::uint32_t seed = 9001;
+        const bool verification_only = argc == 2 &&
+            std::string_view(argv[1]) == "--iq3s-verification-only";
         const std::int32_t widths[] = {1, 2, 3, 4, 5, 6, 8, 9, 17, 40, 70, 130};
         for (const auto& c : cases()) {
+            if (verification_only && c.qtype != QType::GGUF_IQ3_S) { continue; }
             const bool cooperative = c.qtype == QType::GGUF_Q4_K || c.qtype == QType::GGUF_Q6_K;
             for (const std::string_view schedule :
                  cooperative ? std::vector<std::string_view>{"scalar", "cooperative"}
@@ -537,6 +540,7 @@ int main() {
                     force.emplace("gguf_vector/" + std::string(c.name), std::string(schedule));
                 }
                 for (const std::int32_t k : {1536, 2560, 2816, 2112, 704}) {
+                    if (verification_only) { break; }
                     if (k % gguf_block_shape(c.qtype).elements != 0) { continue; }
                     const int f = run_type(c, seed++, k, widths);
                     std::cout << (f == 0 ? "OK   " : "FAIL ") << "gguf " << c.name << " K=" << k
@@ -560,11 +564,23 @@ int main() {
                 std::cout << (profile == 0 ? "OK   " : "FAIL ")
                           << "gguf iq3_s N=10240 K=5120 T=6\n";
                 failures += profile;
+                const std::int32_t verify_neighbors[] = {5, 6, 7};
+                const int down = run_type(c, seed++, 17408, verify_neighbors, 5120);
+                std::cout << (down == 0 ? "OK   " : "FAIL ")
+                          << "gguf iq3_s N=5120 K=17408 T=5,6,7\n";
+                failures += down;
+                for (const std::int32_t n : {5119, 5120, 5121}) {
+                    const int boundary = run_type(c, seed++, 5120, profile_width, n);
+                    std::cout << (boundary == 0 ? "OK   " : "FAIL ")
+                              << "gguf iq3_s N=" << n << " K=5120 T=6\n";
+                    failures += boundary;
+                }
             }
         }
         // The local Qwen3.8-27B artifact's IQ2_S table at its full vocabulary; the other formats
         // a 27B GGUF conversion may store its table in, over a smaller one.
         for (const auto& c : cases()) {
+            if (verification_only) { break; }
             const bool iq2_s = c.qtype == QType::GGUF_IQ2_S;
             if (!iq2_s && c.qtype != QType::GGUF_Q8_0 && c.qtype != QType::GGUF_Q4_K &&
                 c.qtype != QType::GGUF_Q6_K && c.qtype != QType::GGUF_IQ3_S) {

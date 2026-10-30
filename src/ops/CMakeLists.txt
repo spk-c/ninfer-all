@@ -50,10 +50,6 @@ if(NINFER_ADA_GGUF_IQ3S_T6_LOOP)
 endif()
 
 if(NINFER_COMPAT_PATH)
-  if(NINFER_ADA_GGUF_IQ3S_WARP_META)
-    set_property(SOURCE "${CMAKE_CURRENT_LIST_DIR}/linear/gguf/ggml_vec_iq3_s.cu"
-      APPEND PROPERTY COMPILE_DEFINITIONS NINFER_ADA_GGUF_IQ3S_WARP_META=1)
-  endif()
   # NVFP4 W4A4 uses mma.sync...kind::mxf4nvf4.block_scale; FP8 A8 uses
   # mma.sync...kind::f8f6f4. Both qualifiers are Blackwell-only, and sm_80/86/89 have no FP8 or FP4
   # tensor-core path to fall back to, so a build without 120a leaves the owning translation units
