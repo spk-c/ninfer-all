@@ -75,6 +75,14 @@ void test_region_bind_bounds() {
     const auto region = valid.bind(span);
     expect(region.data == backing + 16 && region.bytes == 16,
            "a valid region must still bind at the exact offset");
+    const ninfer::DeviceSpan near_address_limit{
+        reinterpret_cast<void*>(std::numeric_limits<std::uintptr_t>::max() - 7), 16};
+    const ninfer::LayoutRegion wraps{.offset = 8, .bytes = 1, .alignment = 1};
+    expect_throws<std::overflow_error>([&] { (void)wraps.bind(near_address_limit); },
+                                      "a claimed backing size must not permit address wraparound");
+    const ninfer::LayoutRegion invalid_alignment{.offset = 0, .bytes = 1, .alignment = 3};
+    expect_throws<std::logic_error>([&] { (void)invalid_alignment.bind(span); },
+                                   "invalid region alignment must be rejected");
 }
 
 void test_workspace_boundaries() {
