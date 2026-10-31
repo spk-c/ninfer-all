@@ -5,6 +5,7 @@
 param(
     [Parameter(Mandatory=$true)][string]$Model,
     [string]$Cli = '.\build-rtx4090\apps\ninfer.exe',
+    [string]$CandidateCli = '',
     [string]$Bench = '.\build-rtx4090\bench\ninfer_bench.exe',
     [string]$Nsys = 'nsys',
     [string]$Out = '.\profiles\bench\rtx4090-audit',
@@ -20,6 +21,7 @@ try {
     $Model = (Resolve-Path -LiteralPath $Model -ErrorAction Stop).Path
     $Cli = (Resolve-Path -LiteralPath $Cli -ErrorAction Stop).Path
     $Bench = (Resolve-Path -LiteralPath $Bench -ErrorAction Stop).Path
+    if ($CandidateCli) { $CandidateCli = (Resolve-Path -LiteralPath $CandidateCli -ErrorAction Stop).Path }
     $Out = [IO.Path]::GetFullPath((Join-Path $Repo $Out))
     if (-not (Get-Command python -ErrorAction SilentlyContinue)) { throw 'Python 3.11+ required' }
     if (-not (Get-Command nvidia-smi -ErrorAction SilentlyContinue)) { throw 'nvidia-smi required' }
@@ -30,7 +32,8 @@ try {
     if (-not (Get-Command $Nsys -ErrorAction SilentlyContinue) -and
         -not (Test-Path -LiteralPath $Nsys)) { throw 'Nsight Systems nsys not found; specify -Nsys' }
 
-    $graphOut = Join-Path $Out 'graph-memory'
+    $graphOut = Join-Path $Out 'graph-memory-baseline'
+    $candidateGraphOut = Join-Path $Out 'graph-memory-candidate'
     $stem = Join-Path $Out 'decode-dflash2-k5'
     $kernCsv = $stem + '_cuda_gpu_kern_sum.csv'
     $apiCsv = $stem + '_cuda_api_sum.csv'
@@ -43,6 +46,13 @@ try {
     $benchArgs = @('--weights',$Model,'--kv-dtype','rk4v4',
         '--max-ctx','8192','--spec','dflash2','--draft-tokens',[string]$DraftTokens,
         '--lm-head-draft','-n','128','-r','1','--warmup','1','--profile-measured')
+    $candidateGraph = @($graph)
+    $candidateGraph[[array]::IndexOf($candidateGraph,'--cli') + 1] = $CandidateCli
+    $candidateGraph[[array]::IndexOf($candidateGraph,'--output') + 1] = $candidateGraphOut
+    $comparison = @('-m','tools.bench.compare_graph_allowance_sweeps',
+        (Join-Path $graphOut 'graph-allowance-dflash2-rk4v4.json'),
+        (Join-Path $candidateGraphOut 'graph-allowance-dflash2-rk4v4.json'),
+        '--output',(Join-Path $Out 'graph-memory-comparison.json'))
     $profile = @('profile','--force-overwrite','true','--output',$stem,
         '--trace','cuda,nvtx,osrt','--cuda-graph-trace','node',
         '--capture-range','cudaProfilerApi','--capture-range-end','stop',
@@ -54,6 +64,10 @@ try {
 
     if ($PlanOnly) {
         Write-Host "Graph sweep : python $($graph -join ' ')"
+        if ($CandidateCli) {
+            Write-Host "Candidate VRAM sweep: python $($candidateGraph -join ' ')"
+            Write-Host "Compare memory sweeps: python $($comparison -join ' ')"
+        }
         Write-Host "Nsight trace: $Nsys $($profile -join ' ')"
         Write-Host "Nsight stats: $Nsys $($stats -join ' ')"
         Write-Host "IQ4 analysis: python $($analyse -join ' ')"
@@ -73,6 +87,7 @@ try {
         model_size_bytes = $artifact.Length
         model_modified_utc = $artifact.LastWriteTimeUtc.ToString('o')
         cli_path = $Cli
+        candidate_cli_path = $CandidateCli
         cli_sha256 = (Get-FileHash -LiteralPath $Cli -Algorithm SHA256).Hash
         bench_path = $Bench
         bench_sha256 = (Get-FileHash -LiteralPath $Bench -Algorithm SHA256).Hash
@@ -86,6 +101,13 @@ try {
     Write-Host 'Phase 3a: recording repeated graph-memory allowances'
     & python @graph
     if ($LASTEXITCODE -ne 0) { throw 'Graph allowance sweep incomplete; inspect graph-memory output' }
+    if ($CandidateCli) {
+        Write-Host 'Candidate graph-memory sweep (separate samples; GPU drift may confound comparisons)'
+        & python @candidateGraph
+        if ($LASTEXITCODE -ne 0) { throw 'Candidate graph allowance sweep incomplete' }
+        & python @comparison
+        if ($LASTEXITCODE -ne 0) { throw 'Cannot compare graph-memory sweeps' }
+    }
     Write-Host 'Phase 3b: capturing CUDA graph nodes, NVTX and CUDA API wall intervals'
     & $Nsys @profile *> (Join-Path $Out 'nsys-profile.log')
     if ($LASTEXITCODE -ne 0) { throw 'Nsight profile failed; inspect nsys-profile.log' }
