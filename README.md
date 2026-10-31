@@ -1,4 +1,42 @@
-# NInfer-all
+# NInfer-all — RTX 4090 / Ada SM89 Focused Fork
+
+> **SPK-C's RTX 4090-focused development fork** of [iamwavecut/ninfer-all](https://github.com/iamwavecut/ninfer-all), retaining the upstream multi-GPU, multi-model inference engine while adding **native Ada `sm_89` build workflows, CUDA 13.4 tooling, GPU profiling, reproducible benchmarks, and opt-in kernel experiments**.
+
+[**RTX 4090 guide**](docs/rtx4090.md) · [**Build for SM89**](scripts/build-rtx4090.ps1) · [**Benchmark workflow**](scripts/benchmark-rtx4090.ps1) · [**Huihui IQ3_S / DFlash2 qualification**](docs/performance/rtx4090-huihui-iq3s-dflash2.md) · [**Official upstream**](https://github.com/iamwavecut/ninfer-all)
+
+## RTX 4090 development focus
+
+| Area | What this fork provides |
+| --- | --- |
+| **Target GPU** | GeForce RTX 4090, **24 GB**, Ada Lovelace, compute capability **8.9 / SM89** |
+| **CUDA build** | Dedicated Windows `sm_89` wrapper, defaulting to **CUDA 13.4**, without changing upstream's default target |
+| **Device calibration** | Per-GPU route calibration and repeatable device-profile workflows |
+| **Inference experiments** | GGUF IQ3_S / IQ4_XS profiling, DFlash2 / MTP tuning, KV-cache and prefill investigations |
+| **Verification** | Public-Engine A/B benchmarks, regression tests, numerical audits and retained performance evidence |
+| **Experimental kernels** | Optional SFU, BF16x8 SiLU and GGUF IQ3_S candidates, **disabled by default** pending stable whole-Engine gains |
+
+**Start here on Windows (PowerShell):**
+
+```powershell
+git clone https://github.com/spk-c/ninfer-all-rtx4090.git
+cd ninfer-all-rtx4090
+.\scripts\build-rtx4090.ps1 -Test
+.\build-rtx4090\apps\ninfer-calibrate.exe --device 0 --detail
+```
+
+Build requirements and calibration/benchmark instructions: [docs/rtx4090.md](docs/rtx4090.md). The build script uses a separate `build-rtx4090` directory. You still need a compatible `.ninfer` model artifact to run inference.
+
+### Benchmarked model: Huihui Qwen3.8 27B
+
+An RTX 4090 / CUDA 13.4 deployment of the [Huihui Qwen3.8 27B GSQ-RCO IQ3_S, Vision + DFlash2 + MTP NInfer artifact](https://huggingface.co/SPK1337/Huihui-Qwen3.8-27B-Uncensored-GSQ-RCO-IQ3S-Vision-DFlash2-MTP-NInfer) recorded **1,831 completed requests**, a **146.6 tokens/s median decode rate** and **215.5 tokens/s P90** using **DFlash2 (five draft tokens)**. See the [measurement methodology](https://huggingface.co/SPK1337/Huihui-Qwen3.8-27B-Uncensored-GSQ-RCO-IQ3S-Vision-DFlash2-MTP-NInfer/blob/main/BENCHMARK-RTX4090.md).
+
+**Interpretation:** Those numbers are from a real-world model-serving log, **not** an upstream-vs-fork A/B benchmark, an end-to-end throughput claim, or a guaranteed speedup. The [RTX 4090 investigation](docs/rtx4090.md) explicitly records experiments that **did not** establish a stable production gain; experimental CUDA paths remain opt-in. This fork focuses on **measurable, reproducible tuning**, not unverified speedup claims.
+
+**Upstream attribution:** NInfer-all is maintained by [iamwavecut](https://github.com/iamwavecut/ninfer-all) and builds on [NInfer](https://github.com/Neroued/ninfer) and many contributors. The original project overview, multi-GPU support, build instructions, examples and credits are preserved below. See [CONTRIBUTORS.md](CONTRIBUTORS.md) and [LICENSE](LICENSE).
+
+---
+
+## Upstream NInfer-all overview
 
 A C++/CUDA inference engine for the Qwen3.5 model family (Qwen3.6 and Qwen3.8 27B, Qwen3.6-35B-A3B,
 their fine-tunes and Ternary Bonsai 2), Qwen3.8-Flash-Next, Gemma 4 26B-A4B, Recursive's Flint and
