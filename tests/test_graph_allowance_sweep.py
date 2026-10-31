@@ -83,3 +83,39 @@ def test_missing_graph_diagnostics_is_incomplete_not_zero(monkeypatch, tmp_path)
         "--capacities", "4096", "--repeats", "2", "--output", str(tmp_path / "out"),
     ])
     assert result == 2
+
+
+def test_failed_startup_with_memory_diagnostic_still_fails(monkeypatch, tmp_path):
+    exe, model = tmp_path / "ninfer.exe", tmp_path / "qwen.ninfer"
+    exe.write_bytes(b"x")
+    model.write_bytes(b"x")
+    monkeypatch.setattr(sweep.subprocess, "run", lambda *a, **kw:
+                        SimpleNamespace(returncode=1, stdout="",
+                                        stderr="CUDA Graph memory 12 MiB / 64 MiB\nlater failure"))
+    assert sweep.main([
+        "--cli", str(exe), "--model", str(model), "--capacities", "8192",
+        "--repeats", "2", "--output", str(tmp_path / "out"),
+    ]) == 2
+    report = json.loads((tmp_path / "out" / "graph-allowance-none-int8.json").read_text())
+    assert all(r["observed_bytes"] == 12 * sweep.MIB for r in report["runs"])
+    assert all(not r["started"] for r in report["runs"])
+
+
+def test_gdn_fp16_is_used_and_recorded(monkeypatch, tmp_path):
+    exe, model = tmp_path / "ninfer.exe", tmp_path / "qwen.ninfer"
+    exe.write_bytes(b"x")
+    model.write_bytes(b"x")
+    commands = []
+
+    def run(cmd, **kwargs):
+        commands.append(cmd)
+        return SimpleNamespace(returncode=0, stdout="CUDA Graph memory 1 MiB / 64 MiB", stderr="")
+
+    monkeypatch.setattr(sweep.subprocess, "run", run)
+    assert sweep.main([
+        "--cli", str(exe), "--model", str(model), "--capacities", "8192",
+        "--repeats", "2", "--gdn-state-fp16", "--output", str(tmp_path / "out"),
+    ]) == 0
+    assert all("--gdn-state-fp16" in cmd for cmd in commands)
+    report = json.loads((tmp_path / "out" / "graph-allowance-none-int8.json").read_text())
+    assert report["config"]["gdn_state_fp16"] is True

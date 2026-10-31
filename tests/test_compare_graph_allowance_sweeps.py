@@ -53,3 +53,9 @@ def test_mixed_backend_is_not_compared():
 def test_nonmatching_capacities_are_rejected():
     with pytest.raises(ValueError, match="no matching"):
         compare_reports(sweep([sample(4096, 60)]), sweep([sample(8192, 50)]))
+
+
+def test_mixed_gdn_precision_is_not_compared():
+    with pytest.raises(ValueError, match="gdn_state_fp16"):
+        compare_reports(sweep([sample(8192, 60)], gdn_state_fp16=False),
+                        sweep([sample(8192, 50)], gdn_state_fp16=True))

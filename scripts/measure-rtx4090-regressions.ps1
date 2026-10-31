@@ -8,6 +8,7 @@ param(
     [string]$CandidateCli = '',
     [string]$Bench = '.\build-rtx4090\bench\ninfer_bench.exe',
     [string]$Nsys = 'nsys',
+    [string]$Python = 'python',
     [string]$Out = '.\profiles\bench\rtx4090-audit',
     [ValidateRange(2,25)][int]$GraphRepeats = 5,
     [ValidateRange(1,15)][int]$DraftTokens = 5,
@@ -23,7 +24,8 @@ try {
     $Bench = (Resolve-Path -LiteralPath $Bench -ErrorAction Stop).Path
     if ($CandidateCli) { $CandidateCli = (Resolve-Path -LiteralPath $CandidateCli -ErrorAction Stop).Path }
     $Out = [IO.Path]::GetFullPath((Join-Path $Repo $Out))
-    if (-not (Get-Command python -ErrorAction SilentlyContinue)) { throw 'Python 3.11+ required' }
+    & $Python -c 'import sys; assert sys.version_info >= (3, 11), "Python 3.11+ required"'
+    if ($LASTEXITCODE -ne 0) { throw 'Python 3.11+ required' }
     if (-not (Get-Command nvidia-smi -ErrorAction SilentlyContinue)) { throw 'nvidia-smi required' }
     $GpuNames = @(& nvidia-smi --query-gpu=name --format=csv,noheader)
     if ($LASTEXITCODE -ne 0 -or -not ($GpuNames | Where-Object { $_ -match 'RTX 4090' })) {
@@ -41,11 +43,11 @@ try {
     $graph = @('-m','tools.bench.run_graph_allowance_sweep',
         '--cli',$Cli,'--model',$Model,'--spec','dflash2',
         '--draft-tokens',[string]$DraftTokens,'--kv-dtype','rk4v4',
-        '--prefill-chunk','1024','--capacities','8192','32768','65536',
+        '--prefill-chunk','1024','--gdn-state-fp16','--capacities','8192','32768','65536',
         '--repeats',[string]$GraphRepeats,'--output',$graphOut)
     $benchArgs = @('--weights',$Model,'--kv-dtype','rk4v4',
         '--max-ctx','8192','--spec','dflash2','--draft-tokens',[string]$DraftTokens,
-        '--lm-head-draft','-n','128','-r','1','--warmup','1','--profile-measured')
+        '--lm-head-draft','--gdn-state-fp16','-n','128','-r','1','--warmup','1','--profile-measured')
     $candidateGraph = @($graph)
     $candidateGraph[[array]::IndexOf($candidateGraph,'--cli') + 1] = $CandidateCli
     $candidateGraph[[array]::IndexOf($candidateGraph,'--output') + 1] = $candidateGraphOut
@@ -53,8 +55,10 @@ try {
         (Join-Path $graphOut 'graph-allowance-dflash2-rk4v4.json'),
         (Join-Path $candidateGraphOut 'graph-allowance-dflash2-rk4v4.json'),
         '--output',(Join-Path $Out 'graph-memory-comparison.json'))
+    # osrt is a Linux collector; Windows Nsight rejects it before launching the target.
+    $trace = if ($env:OS -eq 'Windows_NT') { 'cuda,nvtx,wddm' } else { 'cuda,nvtx,osrt' }
     $profile = @('profile','--force-overwrite','true','--output',$stem,
-        '--trace','cuda,nvtx,osrt','--cuda-graph-trace','node',
+        '--trace',$trace,'--cuda-graph-trace','node',
         '--capture-range','cudaProfilerApi','--capture-range-end','stop',
         $Bench) + $benchArgs
     $stats = @('stats','--report','cuda_api_sum,cuda_gpu_kern_sum,cuda_gpu_trace',
@@ -95,17 +99,18 @@ try {
         kv_dtype = 'rk4v4'
         spec = 'dflash2'
         draft_tokens = $DraftTokens
+        gdn_state_fp16 = $true
         scope = 'Device-wide graph allocation and Nsight CUDA/host activity; no causal speedup claim'
     }
     $meta | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $Out 'manifest.json') -Encoding utf8
     Write-Host 'Phase 3a: recording repeated graph-memory allowances'
-    & python @graph
+    & $Python @graph
     if ($LASTEXITCODE -ne 0) { throw 'Graph allowance sweep incomplete; inspect graph-memory output' }
     if ($CandidateCli) {
         Write-Host 'Candidate graph-memory sweep (separate samples; GPU drift may confound comparisons)'
-        & python @candidateGraph
+        & $Python @candidateGraph
         if ($LASTEXITCODE -ne 0) { throw 'Candidate graph allowance sweep incomplete' }
-        & python @comparison
+        & $Python @comparison
         if ($LASTEXITCODE -ne 0) { throw 'Cannot compare graph-memory sweeps' }
     }
     Write-Host 'Phase 3b: capturing CUDA graph nodes, NVTX and CUDA API wall intervals'
@@ -117,7 +122,7 @@ try {
         throw 'Nsight kernel or API CSV is missing; do not infer host or kernel times'
     }
     Write-Host 'Phase 3c: calculating measured IQ4_XS time share'
-    & python @analyse
+    & $Python @analyse
     if ($LASTEXITCODE -ne 0) { throw 'IQ4_XS attribution could not be validated' }
     Write-Host "RESULTS: $Out"
     Write-Host "Host-side CUDA API summary: $apiCsv"
