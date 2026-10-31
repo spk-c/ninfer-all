@@ -510,6 +510,13 @@ struct EngineOptions {
     // round takes tens of milliseconds and a chunk hundreds, so strict alternation (1) leaves
     // decoding streams a token per chunk; 0 is prefill_chunk / 64.
     std::uint32_t decode_rounds_per_prefill = 0;
+    // While another request generates, a prefill step is cut so the prefill cost model, scaled by
+    // the ratio of observed to predicted step times, predicts it to take at most this many
+    // milliseconds: a multiple of 128 tokens, at least 512. Each token of the other streams then
+    // waits about this long instead of a whole chunk, and the prompt prefills slower, since a
+    // shorter step reads the weights for fewer tokens. 0 runs the planned chunk; at most 60000.
+    // Qwen3.5-family models only.
+    std::uint32_t prefill_stall_budget_ms = 0;
     // Prefill with the fast INT8-KV prompt-attention kernel and round prefill_chunk down to whole
     // prompt-attention waves. Off keeps the default kernel and the requested chunk.
     bool fast_prefill_kernel           = false;
@@ -563,6 +570,18 @@ struct EngineOptions {
     // already costs, the GDN half carrying nearly all of both. Separable because that is a
     // different trade from the MLP one and an owner may want only the cheaper half.
     bool prefill_cublas_projections        = true;
+    // A native-FP4 card stores the A4 permission for an NVFP4 weight and runs W4A4 by default;
+    // this asks for the dequantising W4A16 routes instead, the higher-precision of the two at the
+    // cost of the FP4 tensor cores. On every other card the loader has already lowered the
+    // permission to A16Only, so the flag is a no-op there: it only ever trades A4 away and never
+    // introduces a compute domain the card lacks.
+    bool nvfp4_w4a16                       = false;
+    // NVFP4 weights on the integer tensor cores with s8-quantised activations (W4A8), prefill and
+    // decode alike: the same activation trade the Q4/Q5 integer routes carry, opt-in per engine.
+    // Which wide mainloop answers follows the route profile's nvfp4_int8/* bands; T <= 8 runs the
+    // row-form kernel under either chain. On a native-FP4 card it replaces the A4 permission.
+    // Where both this and nvfp4_w4a16 are set, nvfp4_w4a16 wins.
+    bool nvfp4_w4a8_int                    = false;
     // Largest merged-token count one media item may occupy; larger media is downscaled at
     // preprocessing. Also bounds the overlay window.
     std::uint32_t vision_max_merged_tokens = 16384;

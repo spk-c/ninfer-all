@@ -38,12 +38,21 @@ enum class LinearPolicy : std::uint8_t {
     /// scales and per-token activation scales, where the integer route carries per-group ones -- so
     /// it is opt-in per engine, and it falls back to AllowA8Int below the width where it pays.
     AllowPrefillCublas,
+    /// AllowA8Int's counterpart for block-scaled NVFP4 weights: the stored E2M1 codes widen
+    /// losslessly to s8 and feed the integer tensor cores with s8-quantised activations, one FP32
+    /// scale per (token, 32 columns) and the per-16 E4M3 weight scales rescaling in FP32. It is the
+    /// same A8-activation quality trade the Q4/Q5 integer routes carry, opt-in per engine with
+    /// --nvfp4-w4a8-int. Which mainloop answers follows the route table -- the own table runs MMQ,
+    /// the unified table runs the grouped ladder, and T <= 8 runs the MMVQ-shaped row-form kernel
+    /// under either -- so a calibrated band chooses it (the nvfp4_int8/* keys).
+    AllowNvfp4Int8,
 };
 
 [[nodiscard]] constexpr bool valid_linear_policy(LinearPolicy policy) noexcept {
     return policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8 ||
            policy == LinearPolicy::AllowA4 || policy == LinearPolicy::AllowA8Int ||
-           policy == LinearPolicy::AllowA8IntDecode || policy == LinearPolicy::AllowPrefillCublas;
+           policy == LinearPolicy::AllowA8IntDecode || policy == LinearPolicy::AllowPrefillCublas ||
+           policy == LinearPolicy::AllowNvfp4Int8;
 }
 
 [[nodiscard]] constexpr bool allows_a8(LinearPolicy policy) noexcept {
@@ -58,6 +67,12 @@ enum class LinearPolicy : std::uint8_t {
 [[nodiscard]] constexpr bool allows_a8_int(LinearPolicy policy) noexcept {
     return policy == LinearPolicy::AllowA8Int || policy == LinearPolicy::AllowA8IntDecode ||
            policy == LinearPolicy::AllowPrefillCublas;
+}
+
+/// The NVFP4 int8-grouped route: the same activation trade as allows_a8_int, but for block-scaled
+/// NVFP4 weights against their stored E2M1/E4M3 planes, and never for any other weight format.
+[[nodiscard]] constexpr bool allows_nvfp4_int8(LinearPolicy policy) noexcept {
+    return policy == LinearPolicy::AllowNvfp4Int8;
 }
 
 /// The cuBLAS prefill route. Only ever admitted past a width gate, because its dequantise pass is
@@ -117,7 +132,10 @@ inline constexpr std::int32_t kCublasPrefillFloorTokens = 128;
  * registered contiguous BF16 problems. Each format owns a finite registry of exact physical
  * weight problems and selects its kernel internally. A RowSplit Q4/Q5/Q6/Q8 problem no registry
  * names, and every one with an FP32 `out`, runs a runtime-shape route over the same templates (any
- * N, K a multiple of 128): a tensor-parallel rank's share of a projection, for instance. So does a
+ * N, K a multiple of 128): a tensor-parallel rank's share of a projection, for instance. The
+ * 248320x5120 vocabulary head is the exception for FP32 `out`: its Q4 and Q8 registered routes up
+ * to T=32 (Q8: up to its K-split widths) and a Q6 device-profile route store their sums unrounded
+ * instead. So does a
  * T2, FP8 or NVFP4 problem, in whole tiles of linear_share_units(): with A16 compute for T2 and for
  * a registered problem's FP32 result whatever the policy; for an FP8 problem no registry names
  * with A8 compute from T=17 where the policy permits it, and for such an NVFP4 problem with K of

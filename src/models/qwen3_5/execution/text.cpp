@@ -105,6 +105,18 @@ Tensor matrix_window(Tensor& t, std::int32_t cols) {
     return t.slice(1, 0, cols);
 }
 
+// A BF16 proposal head writes into the first columns of a logits window; FP32 storage (the step
+// logits) holds them in its leading half.
+Tensor bf16_window(Tensor& t, std::int32_t cols) {
+    const Tensor window = matrix_window(t, cols);
+    return window.dtype == DType::BF16 ? window : Tensor(window.data, DType::BF16, {t.ne[0], cols});
+}
+
+void require_logits_window(const Tensor& t, std::int32_t rows, std::int32_t cols,
+                           const char* label) {
+    require_tensor_window(t, t.dtype == DType::FP32 ? DType::FP32 : DType::BF16, rows, cols, label);
+}
+
 class ScopedPositions {
 public:
     ScopedPositions(const Tensor*& slot, const Tensor& positions) : slot_(slot) {
@@ -491,8 +503,8 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
         }
         require_tensor_shape(*final_hidden, DType::BF16, {dimension(config_.hidden_size), 1},
                              "MTP final prefill hidden");
-        require_tensor_shape(*logits, DType::BF16, {dimension(config_.vocab_size), 1},
-                             "MTP final prefill logits");
+        require_logits_window(*logits, dimension(config_.vocab_size), 1,
+                              "MTP final prefill logits");
         require_tensor_shape(*draft_token, DType::I32, {1}, "MTP final prefill draft token");
     }
 
@@ -602,7 +614,7 @@ void TextContext::proposal_argmax(const Tensor& hidden, Tensor& logits, Tensor& 
     require_tensor_shape(hidden, DType::BF16, {dimension(config_.hidden_size), T},
                          "proposal hidden");
     require_tensor_shape(proposal_tokens, DType::I32, {T}, "proposal tokens");
-    require_tensor_window(logits, DType::BF16, dimension(config_.vocab_size), T, "proposal logits");
+    require_logits_window(logits, dimension(config_.vocab_size), T, "proposal logits");
     nvtx::ScopedRange proposal_range(nvtx::Name::MtpProposal, nvtx::Category::Mtp,
                                      static_cast<std::uint64_t>(T));
     if (proposal_head_ != nullptr) {
@@ -622,7 +634,7 @@ void TextContext::proposal_argmax(const Tensor& hidden, Tensor& logits, Tensor& 
     } else {
         Tensor output_logits = fp32_proposal_logits(mtp_->output_head)
                                    ? work_.alloc(DType::FP32, {dimension(config_.vocab_size), T})
-                                   : matrix_window(logits, T);
+                                   : bf16_window(logits, T);
         project(hidden, mtp_->output_head, output_logits, work_, ctx_.stream);
         ops::argmax(output_logits, proposal_tokens,
                     dimension(parameters_.model.resources().public_token_count), ctx_.stream);
@@ -650,8 +662,7 @@ void TextContext::mtp_forward_batch(const Tensor& ids, const Tensor& hidden,
         if (logits == nullptr || draft_token == nullptr) {
             throw std::invalid_argument("MTP logits and draft_token outputs are required");
         }
-        require_tensor_shape(*logits, DType::BF16, {dimension(config_.vocab_size), 1},
-                             "MTP logits");
+        require_logits_window(*logits, dimension(config_.vocab_size), 1, "MTP logits");
         require_tensor_shape(*draft_token, DType::I32, {1}, "MTP draft token");
     }
 
@@ -689,7 +700,7 @@ void TextContext::mtp_forward_ar_step(const Tensor& token, const Tensor& previou
                          "MTP AR previous hidden");
     require_tensor_shape(mtp_hidden, DType::BF16, {dimension(config_.hidden_size), 1},
                          "MTP AR output hidden");
-    require_tensor_shape(logits, DType::BF16, {dimension(config_.vocab_size), 1}, "MTP AR logits");
+    require_logits_window(logits, dimension(config_.vocab_size), 1, "MTP AR logits");
     require_tensor_shape(draft_token, DType::I32, {1}, "MTP AR draft token");
 
     auto position_scope  = work_.scope();
@@ -721,8 +732,8 @@ void TextContext::ordinary_decode_batch(const Tensor& ids, const Tensor& cache_p
                          "ordinary decode Linear Attention destination slots");
     require_tensor_shape(hidden, DType::BF16, {dimension(config_.hidden_size), batch},
                          "ordinary decode hidden");
-    require_tensor_shape(logits, DType::BF16, {dimension(config_.vocab_size), batch},
-                         "ordinary decode logits");
+    require_tensor_shape(logits, target_logits_dtype(*lm_head_),
+                         {dimension(config_.vocab_size), batch}, "ordinary decode logits");
 
     cudaStream_t stream = ctx_.stream;
     work_.reset();
@@ -774,7 +785,8 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
                          "target verify batch Linear Attention slots");
     require_tensor_shape(hidden, DType::BF16, {dimension(config_.hidden_size), width, batch},
                          "target verify batch hidden");
-    require_tensor_shape(logits, DType::BF16, {dimension(config_.vocab_size), width, batch},
+    require_tensor_shape(logits, target_logits_dtype(*lm_head_),
+                         {dimension(config_.vocab_size), width, batch},
                          "target verify batch logits");
     require_tensor_shape(target_tokens, DType::I32, {width, batch}, "target verify batch tokens");
 
@@ -916,13 +928,19 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
     const bool fused_nvfp4 = input_basis == InputBasis::Primal && single != nullptr &&
                              ops::attn_input_proj_fused_rmsnorm_nvfp4_eligible(single->weight,
                                                                                single->policy, T);
+    // The integer route carries the same edge: one pass over the residual row produces the s8 codes
+    // and per-32 scales the grouped or narrow mainloop reads, so the rmsnorm below is skipped
+    // rather than run and then re-read. The policies are disjoint, and the band decides the width.
+    const bool fused_int8 = !fused_nvfp4 && input_basis == InputBasis::Primal && single != nullptr &&
+                            ops::attn_input_proj_fused_rmsnorm_int8_eligible(
+                                single->weight, single->policy, T);
     Tensor h;
-    if (!fused_nvfp4) {
+    if (!fused_nvfp4 && !fused_int8) {
         h = workspace::matrix(work_, DType::BF16, dimension(config_.hidden_size), T);
     }
     if (input_basis == InputBasis::Rotated) {
         ops::rmsnorm_hadamard(x, w.input_norm, config_.rms_norm_eps, true, input_signs, h, s);
-    } else if (!fused_nvfp4) {
+    } else if (!fused_nvfp4 && !fused_int8) {
         ops::rmsnorm(x, w.input_norm, config_.rms_norm_eps, true, h, s);
     }
 
@@ -942,6 +960,10 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
         ops::attn_input_proj_fused_rmsnorm_nvfp4(x, w.input_norm, config_.rms_norm_eps,
                                                  single->weight, q_flat, gate_flat, k_flat, v_flat,
                                                  single->policy, work_, s);
+    } else if (fused_int8) {
+        ops::attn_input_proj_fused_rmsnorm_int8(x, w.input_norm, config_.rms_norm_eps,
+                                                single->weight, q_flat, gate_flat, k_flat, v_flat,
+                                                single->policy, work_, s);
     } else {
         attention_projection(h, p, q_flat, gate_flat, k_flat, v_flat, work_, s, input_basis);
     }
@@ -1322,14 +1344,35 @@ void TextContext::mlp_tail(const BlockParameters& weights, Tensor& x, Phase phas
         ops::rmsnorm_hadamard(x, weights.post_attention_norm, config.rms_norm_eps, true, *signs, h,
                               ctx_.stream);
         ffn(h, weights.ffn, x, hints, work_, ctx_.stream, false, phase == Phase::Verify,
-            InputBasis::Rotated, false, experts_, residual_partial_);
+            InputBasis::Rotated, false, experts_, nullptr, residual_partial_);
+        return;
+    }
+    // The integer gate_up route normalises while it quantises, so the BF16 normed row never exists:
+    // the residual goes into the FFN un-normed and carries the norm with it. The predicate is the one
+    // the projection itself asks, evaluated with the policy this phase will pass down.
+    const auto* dense = std::get_if<DenseParameters>(&weights.ffn);
+    const bool fused_int8 =
+        dense != nullptr && !dense->up.has_value() &&
+        ops::linear_swiglu_fused_rmsnorm_int8_eligible(
+            dense->gate_up.weight,
+            phase == Phase::Verify ? dense->verify_gate_up_policy : dense->gate_up.policy,
+            static_cast<std::int32_t>(x.ne[1]));
+    const bool wide =
+        wide_residual_verification(phase, row_width(x.ne[1]), row_width(x.ne[1]));
+    if (fused_int8) {
+        // The share writes the row it is given and the all-reduce sums those shares, so a deferred
+        // norm has nowhere to go here. Refuse the combination instead of answering from x.
+        if (residual_partial_ != nullptr) {
+            throw std::logic_error("FFN: the fused int8 input norm has no tensor-parallel share");
+        }
+        const InputNorm norm{&weights.post_attention_norm, config.rms_norm_eps};
+        ffn(x, weights.ffn, x, hints, work_, ctx_.stream, false, phase == Phase::Verify,
+            InputBasis::Primal, wide, experts_, &norm, nullptr);
         return;
     }
     ops::rmsnorm(x, weights.post_attention_norm, config.rms_norm_eps, true, h, ctx_.stream);
     ffn(h, weights.ffn, x, hints, work_, ctx_.stream, false, phase == Phase::Verify,
-        InputBasis::Primal,
-        wide_residual_verification(phase, row_width(x.ne[1]), row_width(x.ne[1])), experts_,
-        residual_partial_);
+        InputBasis::Primal, wide, experts_, nullptr, residual_partial_);
 }
 
 TextContext::GdnShard TextContext::gdn_shard(std::uint32_t layer) const {
@@ -2335,7 +2378,7 @@ PrefillChunkResult TextContext::prefill_final_batch(std::span<const PrefillSegme
         }
         const std::int32_t physical_rows = io_.logits.ne[0];
         const auto token_domain = dimension(parameters_.model.resources().public_token_count);
-        Tensor logits           = work_.alloc(DType::BF16, {physical_rows, outputs});
+        Tensor logits           = work_.alloc(io_.logits.dtype, {physical_rows, outputs});
         project(last, *lm_head_, logits, work_, s);
 
         // The logprob gather reads one contiguous sampling record per row.
@@ -2379,7 +2422,7 @@ PrefillChunkResult TextContext::prefill_final_batch(std::span<const PrefillSegme
         Tensor tokens = work_.alloc(DType::I32, {outputs});
         if (!sample_rows.empty()) {
             const auto sampled   = static_cast<std::int32_t>(sample_rows.size());
-            Tensor sample_logits = work_.alloc(DType::BF16, {physical_rows, sampled});
+            Tensor sample_logits = work_.alloc(io_.logits.dtype, {physical_rows, sampled});
             const DeviceSpan sample_configs_span =
                 work_.alloc_bytes(sizeof(ops::SamplingConfig) * static_cast<std::size_t>(sampled));
             auto* sample_configs = static_cast<ops::SamplingConfig*>(sample_configs_span.data);

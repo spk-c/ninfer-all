@@ -274,6 +274,7 @@ ninfer::EngineOptions make_engine_options(const ServeOptions& options) {
     engine_options.pending_timeout_ms       = options.pending_timeout_ms;
     engine_options.prefill_chunk            = options.prefill_chunk;
     engine_options.decode_rounds_per_prefill = options.decode_rounds_per_prefill;
+    engine_options.prefill_stall_budget_ms   = options.prefill_stall_budget_ms;
     engine_options.fast_prefill_kernel      = options.fast_prefill_kernel;
     engine_options.kv_cache                 = options.kv_cache;
     engine_options.enable_vision            = options.enable_vision;
@@ -303,6 +304,8 @@ ninfer::EngineOptions make_engine_options(const ServeOptions& options) {
     engine_options.suspend                  = options.suspend;
     engine_options.mlp_a8_decode            = options.mlp_a8_decode;
     engine_options.prefill_a8               = options.prefill_a8;
+    engine_options.nvfp4_w4a8_int           = options.nvfp4_w4a8_int;
+    engine_options.nvfp4_w4a16              = options.nvfp4_w4a16;
     engine_options.prefill_cublas           = options.prefill_cublas;
     engine_options.prefill_cublas_projections = options.prefill_cublas_projections;
     engine_options.speculative              = options.speculative;
