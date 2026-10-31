@@ -12,7 +12,7 @@ import statistics
 from pathlib import Path
 
 
-REQUIRED_CONFIG = ("model", "spec", "draft_tokens", "kv_dtype", "prefill_chunk")
+REQUIRED_CONFIG = ("model", "spec", "draft_tokens", "kv_dtype", "prefill_chunk", "gdn_state_fp16")
 
 
 def compare_reports(baseline: dict, candidate: dict) -> dict:

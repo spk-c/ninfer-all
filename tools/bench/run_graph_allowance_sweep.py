@@ -93,7 +93,7 @@ def parse_bytes(value: str, unit: str) -> int:
 
 
 def measure(cli: Path, model: Path, capacity: int, spec: str | None, draft_tokens: int,
-            kv_dtype: str, prefill_chunk: int) -> dict:
+            kv_dtype: str, prefill_chunk: int, gdn_state_fp16: bool = False) -> dict:
     command = [
         str(cli), str(model),
         "--prompt", "hi",
@@ -104,6 +104,8 @@ def measure(cli: Path, model: Path, capacity: int, spec: str | None, draft_token
         "--max-new", "1",
         "--greedy", "--no-thinking",
     ]
+    if gdn_state_fp16:
+        command += ["--gdn-state-fp16"]
     if spec:
         command += ["--spec", spec, "--draft-tokens", str(draft_tokens), "--lm-head-draft"]
 
@@ -152,6 +154,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--draft-tokens", type=int, default=DRAFT_TOKENS)
     parser.add_argument("--kv-dtype", default=KV_DTYPE)
     parser.add_argument("--prefill-chunk", type=int, default=PREFILL_CHUNK)
+    parser.add_argument("--gdn-state-fp16", action="store_true")
     parser.add_argument("--output", type=Path, default=OUT)
     args = parser.parse_args(argv)
     spec = None if args.spec == "none" else args.spec
@@ -173,7 +176,7 @@ def main(argv: list[str] | None = None) -> int:
     for capacity in args.capacities:
         runs = [
             measure(args.cli, args.model, capacity, spec, args.draft_tokens,
-                    args.kv_dtype, args.prefill_chunk)
+                    args.kv_dtype, args.prefill_chunk, args.gdn_state_fp16)
             for _ in range(args.repeats)
         ]
         rows.extend(runs)
@@ -187,7 +190,8 @@ def main(argv: list[str] | None = None) -> int:
         spread = max(seen) - min(seen)
         allowance = next(r["allowance_bytes"] for r in runs if r["allowance_bytes"] is not None)
         blocked = sum(1 for r in runs if r["graph_blocked"])
-        verdict = "ok" if blocked == 0 and len(seen) == len(runs) else (
+        failed = sum(r["returncode"] != 0 for r in runs)
+        verdict = "ok" if failed == 0 and len(seen) == len(runs) else (
             f"BLOCKED {blocked}/{len(runs)}" if blocked else "INCOMPLETE"
         )
         graph_label = "n/a" if graphs is None else str(graphs)
@@ -202,6 +206,7 @@ def main(argv: list[str] | None = None) -> int:
             "cli": str(args.cli), "model": str(args.model), "repeats": args.repeats,
             "spec": spec, "draft_tokens": args.draft_tokens if spec else None,
             "kv_dtype": args.kv_dtype, "prefill_chunk": args.prefill_chunk,
+            "gdn_state_fp16": args.gdn_state_fp16,
             "capacities": args.capacities,
         },
         "runs": rows,
@@ -209,7 +214,8 @@ def main(argv: list[str] | None = None) -> int:
     destination = args.output / f"graph-allowance-{args.spec}-{args.kv_dtype}.json"
     destination.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     print(f"\nwrote {destination}")
-    return 0 if all(r["observed_bytes"] is not None for r in rows) else 2
+    return 0 if all(r["returncode"] == 0 and r["observed_bytes"] is not None
+                    for r in rows) else 2
 
 
 if __name__ == "__main__":
