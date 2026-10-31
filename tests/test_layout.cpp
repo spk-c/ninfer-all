@@ -61,6 +61,22 @@ void test_workspace_scopes() {
     expect(layout.peak_bytes(1) == 331, "scope unwinding must restore the cursor");
 }
 
+// The region must reject an out-of-bounds offset before computing base + offset.
+void test_region_bind_bounds() {
+    unsigned char backing[32]{};
+    const ninfer::DeviceSpan span{backing, sizeof(backing)};
+    const ninfer::LayoutRegion beyond{.offset = 33, .bytes = 1, .alignment = 1};
+    expect_throws<std::out_of_range>([&] { (void)beyond.bind(span); },
+                                     "out-of-bounds offset must fail before pointer arithmetic");
+    const ninfer::LayoutRegion overrun{.offset = 24, .bytes = 9, .alignment = 1};
+    expect_throws<std::out_of_range>([&] { (void)overrun.bind(span); },
+                                     "out-of-bounds size must be rejected");
+    const ninfer::LayoutRegion valid{.offset = 16, .bytes = 16, .alignment = 1};
+    const auto region = valid.bind(span);
+    expect(region.data == backing + 16 && region.bytes == 16,
+           "a valid region must still bind at the exact offset");
+}
+
 void test_workspace_boundaries() {
     ninfer::WorkspaceLayoutBuilder layout;
     (void)layout.alloc_bytes(3, 1);
@@ -101,5 +117,6 @@ void test_workspace_boundaries() {
 int main() {
     test_workspace_scopes();
     test_workspace_boundaries();
+    test_region_bind_bounds();
     return failures == 0 ? 0 : 1;
 }
